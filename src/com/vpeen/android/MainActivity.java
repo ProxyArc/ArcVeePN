@@ -404,14 +404,21 @@ public class MainActivity extends Activity {
         /** sb15: called from the JS 1 s poll while connected.
          *  Consumes a debounced underlying-network change (see
          *  VpnTunnelService.consumeNetChangeIfDue) and
-         *  re-establishes the tunnel. Guards: VPN mode only (the
-         *  proxy is per-connection), connected only, never while
-         *  already connecting. last_selection is untouched. */
+         *  re-establishes the tunnel. Guards: connected only,
+         *  never while already connecting. last_selection is
+         *  untouched.
+         *  v1.9-proxyfix: proxy mode is included now. It used to
+         *  return early ("the proxy is per-connection") — but the
+         *  proxy's outbound sockets and DNS state are bound to the
+         *  network the service started on, so when another VPN
+         *  (Nord) comes up or goes down the running proxy keeps
+         *  its dead state forever. Re-establishing (full stop +
+         *  fresh start, same server / Fastest re-test) is what
+         *  revives it — exactly like VPN mode. */
         @JavascriptInterface
         public void pollNetworkChange() {
             try {
                 if (!VpnTunnelService.running) return;
-                if (VpnTunnelService.proxyMode) return;
                 if (connecting) return;
                 if (!VpnTunnelService.consumeNetChangeIfDue()) return;
                 ConnectLog.log(MainActivity.this,
@@ -556,7 +563,16 @@ public class MainActivity extends Activity {
                 // sb10: current mode + local proxy ports, so the
                 // side panel can reflect the persisted mode and
                 // show the proxy address while proxy mode is on.
-                o.put("mode", AppSettings.getMode(MainActivity.this));
+                // v1.9-ipfix: while connected the tag must show
+                // the RUNNING service's mode, not the persisted
+                // setting — the two can diverge (mode flipped
+                // without the service restarting), and the UI
+                // then claimed "Proxy" while a VPN tunnel was
+                // up (or vice versa). Disconnected, the
+                // persisted mode is the selected one.
+                o.put("mode", connected
+                        ? (VpnTunnelService.proxyMode ? "proxy" : "vpn")
+                        : AppSettings.getMode(MainActivity.this));
                 o.put("socksPort", LocalSocksServer.SOCKS_PORT);
                 o.put("httpPort", LocalSocksServer.HTTP_PORT);
                 o.put("ip", lastIp);
@@ -1302,12 +1318,26 @@ public class MainActivity extends Activity {
             }
         } catch (Throwable ignored) {}
         VpnTunnelService.extraServers = extras;
-        // sb14: if a tunnel is already up for a DIFFERENT server
-        // (a superseded attempt started it), stop it first and
-        // wait for it to go down — startTunnel() is a no-op while
+        // sb14: if a tunnel is already up, stop it first and wait
+        // for it to go down — startTunnel() is a no-op while
         // running, so starting over it would silently keep the
         // old server.
-        if (VpnTunnelService.running && VpnTunnelService.runningServer != server) {
+        // v1.9-proxyfix: this used to apply only when the running
+        // server was DIFFERENT; the same-server case returned
+        // success without restarting ("Already up for this exact
+        // server — nothing to start"). A Connect on a stale
+        // running service — e.g. the proxy after another VPN
+        // (Nord) came and went, whose outbound/DNS state is dead
+        // — then never restarted sing-box, so the dead proxy
+        // stayed dead however often the user tapped Connect. A
+        // Connect now always restarts the service (stop + fresh
+        // start). No automatic path depends on the old no-op:
+        // optimize / reconnectAfterNetworkChange disconnect first,
+        // and the Fastest re-test only ever switches to a
+        // DIFFERENT server — so the only caller that reaches here
+        // with the service already up is a (re)connect to the
+        // same server, where a restart is exactly what is wanted.
+        if (VpnTunnelService.running) {
             Intent d = new Intent(this, VpnTunnelService.class);
             d.setAction(VpnTunnelService.ACTION_DISCONNECT);
             startService(d);
@@ -1317,17 +1347,6 @@ public class MainActivity extends Activity {
                 if (!VpnTunnelService.running) break;
             }
             if (VpnTunnelService.running) return false;
-        }
-        // Already up for this exact server — nothing to start.
-        if (VpnTunnelService.running && VpnTunnelService.runningServer == server) {
-            if (!epochAlive(epoch)) return false;
-            watchdogStop = false;
-            startWatchdog();
-            startSbPingPoller();
-            // sb15: Fastest re-test only while on Fastest in VPN mode.
-            if (fastestModeFlag && !VpnTunnelService.proxyMode) startFastestRetest();
-            new Bridge().checkExitIp();
-            return true;
         }
         Intent i = new Intent(this, VpnTunnelService.class);
         i.setAction(VpnTunnelService.ACTION_CONNECT);
@@ -1495,10 +1514,14 @@ public class MainActivity extends Activity {
     }
 
     /** sb15: re-establish the tunnel after a real underlying-
-     *  network change (debounced, VPN mode only, connected only).
-     *  The old tunnel's sockets are on the old network, so it
-     *  must be re-established either way — but the server only
-     *  ever changes in Fastest mode:
+     *  network change (debounced, both modes, connected only).
+     *  v1.9-proxyfix: proxy mode included — a change of the
+     *  underlying network, or of another VPN's presence (see
+     *  VpnTunnelService.vpnPresenceSuffix), re-establishes the
+     *  proxy the same way as the VPN. The old tunnel's sockets
+     *  are on the old network, so it must be re-established
+     *  either way — but the server only ever changes in Fastest
+     *  mode:
      *  - Fastest: full fresh re-test of all regions + connect to
      *    the overall best server (no margin needed — a reconnect
      *    is required anyway; if the best is the same server it

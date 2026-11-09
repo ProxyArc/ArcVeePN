@@ -193,6 +193,12 @@ public class SingBoxPlatform implements PlatformInterface, CommandServerHandler 
                             || pkg.equals(service.getPackageName())) continue;
                     try {
                         b.addAllowedApplication(pkg);
+                        // DIAG (v1.9-fix): success lines — the old
+                        // log only recorded FAILED allows, so a
+                        // split test could never prove the allow
+                        // actually applied. A "split allow OK"
+                        // line per package is the proof.
+                        ConnectLog.log(service, "split allow OK " + pkg);
                     } catch (Throwable e) {
                         ConnectLog.log(service, "split allow FAILED " + pkg
                                 + ": " + e.getClass().getSimpleName());
@@ -223,6 +229,9 @@ public class SingBoxPlatform implements PlatformInterface, CommandServerHandler 
                                 || pkg.equals(service.getPackageName())) continue;
                         try {
                             b.addDisallowedApplication(pkg);
+                            // DIAG (v1.9-fix): success line — see
+                            // the "split allow OK" note above.
+                            ConnectLog.log(service, "split disallow OK " + pkg);
                         } catch (Throwable e) {
                             ConnectLog.log(service, "split disallow FAILED " + pkg
                                     + ": " + e.getClass().getSimpleName());
@@ -271,6 +280,9 @@ public class SingBoxPlatform implements PlatformInterface, CommandServerHandler 
 
     @Override
     public void startDefaultInterfaceMonitor(InterfaceUpdateListener listener) {
+        // DIAG (v1.9-fix): entry line — this is the first Go
+        // callback in the service-start window.
+        try { ConnectLog.log(service, "startDefaultInterfaceMonitor begin"); } catch (Throwable ignored) {}
         defaultInterfaceListener = listener;
         notifyDefaultInterface();
     }
@@ -283,6 +295,11 @@ public class SingBoxPlatform implements PlatformInterface, CommandServerHandler 
     public void notifyDefaultInterface() {
         InterfaceUpdateListener l = defaultInterfaceListener;
         if (l == null) return;
+        // DIAG (v1.9-fix): entry/exit lines — Go's
+        // updateDefaultInterface runs UpdateInterfaces() from
+        // here, so a death between these two lines points at
+        // the Go interface-refresh path.
+        try { ConnectLog.log(service, "notifyDefaultInterface begin"); } catch (Throwable ignored) {}
         try {
             ConnectivityManager cm = (ConnectivityManager)
                     service.getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -305,14 +322,30 @@ public class SingBoxPlatform implements PlatformInterface, CommandServerHandler 
             boolean constrained = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
                     && !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_CONGESTED);
             l.updateDefaultInterface(lp.getInterfaceName(), index, expensive, constrained);
+            try { ConnectLog.log(service, "notifyDefaultInterface OK if="
+                    + lp.getInterfaceName() + " idx=" + index); } catch (Throwable ignored) {}
         } catch (Throwable e) {
             Log.w(TAG, "notifyDefaultInterface failed", e);
+            try { ConnectLog.log(service, "notifyDefaultInterface FAILED: "
+                    + e.getClass().getSimpleName()); } catch (Throwable ignored) {}
         }
     }
 
     @Override
     public io.nekohasekai.libbox.NetworkInterfaceIterator getInterfaces() {
+        // DIAG (v1.9-fix): the v1.8/v1.9 crash dies inside
+        // startOrReloadService with no FAILED line and no openTun
+        // — i.e. inside a Go-invoked callback in this window.
+        // The %scope strip (v1.9) is verified in the shipped APK,
+        // and the fork's only MustParse is on these Addresses, so
+        // the next crash must be pinned to the exact callback:
+        // entry + exit lines here (with the FINAL address strings
+        // handed to Go) say whether getInterfaces() itself died
+        // or returned. Silent file only — never on screen.
+        ConnectLog.log(service, "getInterfaces begin");
         List<io.nekohasekai.libbox.NetworkInterface> out = new ArrayList<>();
+        int stripped = 0;
+        StringBuilder addrLog = new StringBuilder();
         try {
             ConnectivityManager cm = (ConnectivityManager)
                     service.getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -345,8 +378,14 @@ public class SingBoxPlatform implements PlatformInterface, CommandServerHandler 
                         // Strip the zone id; the prefix is identical.
                         String host = ia.getAddress().getHostAddress();
                         int pct = host.indexOf('%');
-                        if (pct >= 0) host = host.substring(0, pct);
+                        if (pct >= 0) { host = host.substring(0, pct); stripped++; }
                         addrs.add(host + "/" + ia.getNetworkPrefixLength());
+                        // DIAG (v1.9-fix): record the FINAL strings
+                        // handed to Go — if a '%' ever shows up
+                        // here, the strip failed.
+                        if (addrLog.length() > 0) addrLog.append(',');
+                        addrLog.append(host).append('/')
+                                .append(ia.getNetworkPrefixLength());
                     }
                     ni.setAddresses(new StrIter(addrs));
                     List<String> dns = new ArrayList<>();
@@ -381,7 +420,14 @@ public class SingBoxPlatform implements PlatformInterface, CommandServerHandler 
             }
         } catch (Throwable e) {
             Log.w(TAG, "getInterfaces failed", e);
+            try { ConnectLog.log(service, "getInterfaces FAILED: "
+                    + e.getClass().getSimpleName()); } catch (Throwable ignored) {}
         }
+        // DIAG (v1.9-fix): exit line — if the next crash's log
+        // ends at "getInterfaces begin" without this line, the
+        // death is inside this callback.
+        try { ConnectLog.log(service, "getInterfaces OK n=" + out.size()
+                + " stripped%=" + stripped + " addrs=[" + addrLog + "]"); } catch (Throwable ignored) {}
         final java.util.Iterator<io.nekohasekai.libbox.NetworkInterface> it = out.iterator();
         return new NetworkInterfaceIterator() {
             @Override public boolean hasNext() { return it.hasNext(); }
@@ -513,6 +559,10 @@ public class SingBoxPlatform implements PlatformInterface, CommandServerHandler 
         return new LocalDNSTransport() {
             @Override public boolean raw() { return false; }
             @Override public void exchange(ExchangeContext ctx, byte[] message) {
+                // DIAG (v1.9-fix): entry line — Exchange is only
+                // expected after openTun; if it ever fires during
+                // service start, that itself is the lead.
+                try { ConnectLog.log(service, "localDNS exchange begin"); } catch (Throwable ignored) {}
                 // sb15 HARDENING: this is called from native Go
                 // (libbox DNS transport). If ctx.errorCode itself
                 // throws (context already closed/timed out on the
@@ -522,6 +572,11 @@ public class SingBoxPlatform implements PlatformInterface, CommandServerHandler 
                 try { ctx.errorCode(4); } catch (Throwable ignored) {}
             }
             @Override public void lookup(ExchangeContext ctx, String network, String domain) {
+                // DIAG (v1.9-fix): entry line — a lookup during
+                // service start (before openTun) would prove DNS
+                // IS in the crash window after all.
+                try { ConnectLog.log(service, "localDNS lookup begin net="
+                        + network + " domain=" + domain); } catch (Throwable ignored) {}
                 // sb15 HARDENING: lookup() is called from native
                 // Go, so NO Throwable may ever escape it — a Java
                 // exception crossing into the Go runtime kills

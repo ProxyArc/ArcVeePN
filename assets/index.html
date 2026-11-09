@@ -460,7 +460,7 @@
     {flag:'🇺🇸',country:'United States',city:'Virginia',code:'us-va',ip:'104.248.60.15'}
   ];
   var FASTEST = {flag:'⚡',country:'Fastest',city:'Auto',code:'fastest',ip:''};
-  var sel = FASTEST, state = 'idle', liveIp = null, pendingReconnect = false, lastActualCode = null;
+  var sel = FASTEST, state = 'idle', liveIp = null, pendingReconnect = false, lastActualCode = null, lastIpCheckAt = 0;
   var pings = {};
   function pingText(code){
     if(code === 'fastest'){
@@ -607,6 +607,19 @@
       if(s.connected){
         if(state !== 'on') setState('on');
         showIp(s.ip, s.regionCode);
+        // v1.9-ipfix: the exit-IP check runs exactly once per
+        // connect (Bridge.checkExitIp at the end of a successful
+        // startServiceWithServer). If that one fetch fails — the
+        // tunnel is seconds old, the outbound is not ready yet,
+        // or ipify is slow — lastIp stays '—', showIp ignores
+        // it, and the IP box reads "Not connected" forever even
+        // though the tunnel works. Retry it here, throttled to
+        // once per 10 s, while connected and the IP is unknown.
+        // The check itself never touches the UI on failure.
+        if((!s.ip || s.ip === '—' || s.ip === '?') && Date.now() - lastIpCheckAt > 10000){
+          lastIpCheckAt = Date.now();
+          try{ AndroidBridge.checkExitIp(); }catch(e){}
+        }
         // sb11: the connected server's ping is the RTT ping (a
         // request/response on an established CONNECT tunnel, ~1
         // RTT — what Speedtest measures). Overwrites the

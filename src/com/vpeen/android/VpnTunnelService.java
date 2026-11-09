@@ -267,6 +267,16 @@ public class VpnTunnelService extends VpnService {
                 connectRegionCode, fastestMode, extraServers, proxy);
         Log.i(TAG, "sing-box config:\n" + config);
         ConnectLog.log(this, "config built len=" + config.length());
+        // DIAG (v1.9-fix): prove WHICH config was built — a proxy
+        // test's log must show mixed+http inbounds and no TUN,
+        // a VPN test's log must show the TUN. String checks only,
+        // no behaviour change.
+        ConnectLog.log(this, "config inbounds proxy=" + proxy
+                + " mixed=" + config.contains("\"mixed-in\"")
+                + " http=" + config.contains("\"http-in\"")
+                + " tun=" + config.contains("\"tun-in\"")
+                + " splitMode=" + splitMode
+                + " splitPkgs=" + (splitPackages == null ? 0 : splitPackages.size()));
         TunnelRunner r = loadRunner();
         runner = r;
         ConnectLog.log(this, "runner loaded OK");
@@ -284,18 +294,27 @@ public class VpnTunnelService extends VpnService {
         status = "Connected to " + currentRegion;
         ConnectLog.log(this, "running=true");
         Log.i(TAG, "sing-box tunnel up, region=" + currentRegion + " server=" + server);
-        // sb15: watch the underlying network from now on (VPN
-        // mode only) — a change re-establishes the tunnel.
+        // sb15: watch the underlying network from now on (both
+        // modes — v1.9-proxyfix: proxy mode included, so another
+        // VPN coming/going re-establishes the proxy too) — a
+        // change re-establishes the tunnel.
         try { registerNetCallback(); } catch (Throwable ignored) {}
     }
 
     // ---------- sb15: underlying-network-change detection ----------
 
-    /** Register the network callback (VPN mode only). The baseline
+    /** Register the network callback (both modes). The baseline
      *  is the underlying network we are already on — registering
-     *  must NOT fire for the current network. */
+     *  must NOT fire for the current network.
+     *  v1.9-proxyfix: proxy mode used to return early here, so a
+     *  proxy never learned that the underlying network changed —
+     *  e.g. another VPN app (Nord) coming up or going down. The
+     *  proxy's outbound sockets and DNS state are bound to the
+     *  network the service started on, so without this the proxy
+     *  kept its dead state forever after Nord went away, and only
+     *  a full stop + fresh start (which a VPN-mode connect forces
+     *  via the mode-switch disconnect) could revive it. */
     private void registerNetCallback() {
-        if (proxyMode) return;
         try {
             ConnectivityManager cm = (ConnectivityManager)
                     getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -387,6 +406,7 @@ public class VpnTunnelService extends VpnService {
                 }
             } catch (Throwable ignored) {}
             Network unvalidated = null;
+            String base = null;
             for (Network n : ordered) {
                 NetworkCapabilities caps;
                 try { caps = cm.getNetworkCapabilities(n); } catch (Throwable ignored) { continue; }
@@ -394,18 +414,57 @@ public class VpnTunnelService extends VpnService {
                 if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue;
                 if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue;
                 if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
-                    return networkKey(n, caps);
+                    base = networkKey(n, caps);
+                    break;
                 }
                 if (unvalidated == null) unvalidated = n;
             }
-            if (unvalidated == null) return null;
-            NetworkCapabilities caps;
-            try { caps = cm.getNetworkCapabilities(unvalidated); } catch (Throwable ignored) { return null; }
-            if (caps == null) return null;
-            return networkKey(unvalidated, caps);
+            if (base == null) {
+                if (unvalidated == null) return null;
+                NetworkCapabilities caps;
+                try { caps = cm.getNetworkCapabilities(unvalidated); } catch (Throwable ignored) { return null; }
+                if (caps == null) return null;
+                base = networkKey(unvalidated, caps);
+            }
+            // v1.9-proxyfix: in proxy mode ArcVeePN has no TUN, so
+            // ANY TRANSPORT_VPN network is ANOTHER app's VPN (e.g.
+            // Nord). Its appearance/disappearance changes the path
+            // the proxy's outbound sockets take, so it must change
+            // this key — the underlying Wi-Fi/cellular key alone
+            // never changes when another VPN comes or goes, so
+            // Nord on/off was invisible to this detector and the
+            // proxy never re-established. In VPN mode our own TUN
+            // is a VPN network, so the suffix is proxy-only (our
+            // own TUN coming/going is handled by onRevoke and the
+            // start/stop lifecycle, not by this detector).
+            if (proxyMode) base += vpnPresenceSuffix(cm);
+            return base;
         } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    /** "|V<handle>" while another VPN network is up, "|V-" when
+     *  none. The handle identifies the VPN network, so a
+     *  different VPN — or the same one re-established — also
+     *  changes the key. */
+    private static String vpnPresenceSuffix(ConnectivityManager cm) {
+        try {
+            if (cm == null) return "|V-";
+            Network[] all = cm.getAllNetworks();
+            if (all != null) {
+                for (Network n : all) {
+                    if (n == null) continue;
+                    NetworkCapabilities caps;
+                    try { caps = cm.getNetworkCapabilities(n); } catch (Throwable ignored) { continue; }
+                    if (caps == null) continue;
+                    if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue;
+                    if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue;
+                    return "|V" + n.getNetworkHandle();
+                }
+            }
+        } catch (Throwable ignored) {}
+        return "|V-";
     }
 
     /** Network identity + transport type: the key changes when
@@ -496,6 +555,10 @@ public class VpnTunnelService extends VpnService {
     }
 
     public synchronized void stopTunnel() {
+        // DIAG (v1.9-fix): entry line — pairs with the
+        // runner.stop lines, so the log shows whether a previous
+        // tunnel was fully torn down before the next connect.
+        try { ConnectLog.log(this, "stopTunnel begin running=" + running); } catch (Throwable ignored) {}
         // sb15: stop watching the network first — no event may
         // fire while the tunnel is being torn down.
         try { unregisterNetCallback(); } catch (Throwable ignored) {}

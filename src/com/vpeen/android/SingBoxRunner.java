@@ -195,8 +195,26 @@ public class SingBoxRunner implements TunnelRunner {
         statsClient = null;
         try { if (statsThread != null) statsThread.interrupt(); } catch (Throwable ignored) {}
         statsThread = null;
-        try { if (commandServer != null) commandServer.closeService(); } catch (Throwable ignored) {}
-        try { if (commandServer != null) commandServer.close(); } catch (Throwable ignored) {}
+        // DIAG (v1.9-fix): log whether the previous service
+        // actually stopped cleanly — the 12:36 crash came after
+        // proxy/split tests in the same process, so a half-dead
+        // previous service is a live hypothesis for the next
+        // start. Silent file only.
+        try { ConnectLog.log(service, "runner.stop begin"); } catch (Throwable ignored) {}
+        try {
+            if (commandServer != null) commandServer.closeService();
+            try { ConnectLog.log(service, "runner.stop closeService OK"); } catch (Throwable ignored) {}
+        } catch (Throwable e) {
+            try { ConnectLog.log(service, "runner.stop closeService FAILED: "
+                    + e.getClass().getSimpleName()); } catch (Throwable ignored) {}
+        }
+        try {
+            if (commandServer != null) commandServer.close();
+            try { ConnectLog.log(service, "runner.stop close OK"); } catch (Throwable ignored) {}
+        } catch (Throwable e) {
+            try { ConnectLog.log(service, "runner.stop close FAILED: "
+                    + e.getClass().getSimpleName()); } catch (Throwable ignored) {}
+        }
         commandServer = null;
         try { if (platform != null) platform.closeTun(); } catch (Throwable ignored) {}
         platform = null;
