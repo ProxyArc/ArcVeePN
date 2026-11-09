@@ -195,6 +195,99 @@
   .ping{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--muted);white-space:nowrap;margin-left:4px}
   .ping.good{color:var(--green)}
   .ping.slow{color:var(--amber)}
+  /* sb10: hamburger + side panel (slides in from the right) */
+  .burger{width:38px;height:38px;flex:0 0 auto;border-radius:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4.5px;
+    background:var(--card);border:1px solid var(--stroke);transition:background .25s,border-color .25s,transform .18s}
+  .burger:hover{border-color:var(--stroke-hi);background:var(--card-hover)}
+  .burger:active{transform:scale(.9)}
+  .burger span{display:block;width:17px;height:2px;border-radius:2px;background:var(--muted);transition:transform .3s ease,opacity .2s ease,background .25s}
+  .burger:hover span{background:var(--txt)}
+  .burger.open span:nth-child(1){transform:translateY(6.5px) rotate(45deg)}
+  .burger.open span:nth-child(2){opacity:0}
+  .burger.open span:nth-child(3){transform:translateY(-6.5px) rotate(-45deg)}
+  .backdrop{position:fixed;inset:0;background:rgba(2,6,16,.55);opacity:0;visibility:hidden;transition:opacity .3s ease,visibility .3s;z-index:100}
+  body.panel-open .backdrop{opacity:1;visibility:visible}
+  .panel{position:fixed;top:0;right:0;bottom:0;width:min(330px,86vw);z-index:101;display:flex;flex-direction:column;
+    background:var(--menu-bg);border-left:1px solid var(--menu-border);
+    box-shadow:-18px 0 50px rgba(0,0,0,.4);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+    transform:translateX(105%);transition:transform .3s ease;overflow:hidden}
+  body.panel-open .panel{transform:none}
+  .panel-head{display:flex;align-items:center;justify-content:space-between;padding:18px 18px 12px;flex:0 0 auto}
+  .panel-head b{font-size:17px;letter-spacing:-.2px}
+  .panel-close{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;background:var(--card);border:1px solid var(--stroke);color:var(--muted);transition:.2s}
+  .panel-close:hover{color:var(--txt);border-color:var(--stroke-hi);background:var(--card-hover)}
+  .panel-close svg{width:15px;height:15px}
+  .panel-body{flex:1 1 auto;overflow-y:auto;padding:4px 18px 22px;display:flex;flex-direction:column;gap:22px}
+  .panel-body::-webkit-scrollbar{width:6px}
+  .panel-body::-webkit-scrollbar-thumb{background:var(--stroke-hi);border-radius:99px}
+  .psec-title{font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);margin-bottom:10px}
+  .seg{display:flex;gap:4px;padding:4px;border-radius:13px;background:var(--card);border:1px solid var(--stroke)}
+  .seg-btn{flex:1;padding:9px 6px;border-radius:9px;font-size:13px;font-weight:700;color:var(--muted);transition:.22s;text-align:center}
+  .seg-btn:hover{color:var(--txt)}
+  .seg-btn.active{color:#06121a;background:linear-gradient(115deg,#67e8f9,#a78bfa 60%,#f0abfc);box-shadow:0 4px 14px var(--btn-shadow)}
+  .psec-hint{margin-top:9px;font-size:12px;line-height:1.6;color:var(--muted)}
+  .proxy-line{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:11px;background:var(--card);border:1px solid var(--stroke);margin-bottom:7px}
+  .proxy-line span{font-size:12.5px;font-weight:600;color:var(--muted)}
+  .proxy-line code{font-family:"JetBrains Mono",monospace;font-size:12.5px;color:var(--cyan);direction:ltr}
+  .psec-btn{width:100%;padding:11px 12px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);font-size:13.5px;font-weight:600;text-align:center;transition:.2s}
+  .psec-btn:hover:not(:disabled){border-color:var(--cyan);background:var(--card-hover)}
+  .psec-btn:disabled{opacity:.45;cursor:default}
+  .appview{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;background:var(--menu-bg);transform:translateX(100%);transition:transform .3s ease}
+  .appview.show{transform:none}
+  .appview-head{display:flex;align-items:center;gap:12px;padding:18px 18px 12px;flex:0 0 auto}
+  .appview-head b{font-size:16px}
+  .appview-back{font-size:13.5px;font-weight:600;color:var(--cyan);padding:6px 4px}
+  .appview .seg{margin:0 18px 10px;flex:0 0 auto}
+  .app-search{margin:0 18px 10px;padding:11px 13px;border-radius:12px;border:1px solid var(--stroke);background:var(--card);color:var(--txt);font-family:inherit;font-size:13.5px;flex:0 0 auto}
+  .app-search::placeholder{color:var(--dim)}
+  .app-list{flex:1 1 auto;overflow-y:auto;padding:0 14px 10px;display:flex;flex-direction:column;gap:2px}
+  .app-list::-webkit-scrollbar{width:6px}
+  .app-list::-webkit-scrollbar-thumb{background:var(--stroke-hi);border-radius:99px}
+  .app-row{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:11px;cursor:pointer;transition:background .15s}
+  .app-row:hover{background:var(--card-hover)}
+  .app-row input{width:17px;height:17px;flex:0 0 auto;accent-color:var(--cyan)}
+  .app-row .app-name{flex:1;min-width:0;font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .app-row .app-pkg{font-family:"JetBrains Mono",monospace;font-size:9.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42%}
+  .app-empty{padding:22px;text-align:center;font-size:13px;color:var(--muted)}
+  .app-save{margin:6px 18px 18px;padding:12px;border-radius:13px;font-size:14px;font-weight:700;color:#06121a;
+    background:linear-gradient(115deg,#67e8f9,#a78bfa 60%,#f0abfc);box-shadow:0 7px 20px var(--btn-shadow);flex:0 0 auto;transition:transform .18s}
+  .app-save:active{transform:scale(.97)}
+  /* sb11: proxy mode toggle switch + mode tag + app icons */
+  .switch-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 12px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);margin-top:10px}
+  .switch-label{font-size:13.5px;font-weight:700}
+  .switch{width:52px;height:31px;flex:0 0 auto;border-radius:999px;background:rgba(128,138,165,.4);position:relative;transition:background .25s ease;border:1px solid var(--stroke-hi);padding:0}
+  .switch .knob{position:absolute;top:2px;left:2px;width:25px;height:25px;border-radius:50%;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.35);transition:transform .25s cubic-bezier(.34,1.56,.64,1)}
+  .switch.on{background:linear-gradient(115deg,#67e8f9,#a78bfa 60%,#f0abfc)}
+  .switch.on .knob{transform:translateX(21px)}
+  .modetag{font-family:"JetBrains Mono",monospace;font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);border:1px solid var(--stroke);border-radius:999px;padding:5px 10px}
+  .app-ico-wrap{width:34px;height:34px;flex:0 0 auto;position:relative;border-radius:9px;overflow:hidden}
+  .app-ico-ph{position:absolute;inset:0;display:grid;place-items:center;background:var(--card);border:1px solid var(--stroke);font-size:15px;font-weight:700;color:var(--cyan)}
+  .app-ico{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  /* sb13: MUCH smoother reveal — GPU-composited transform +
+     opacity ONLY. max-height/height are NEVER animated (that
+     caused the layout jank); max-height/visibility switch
+     instantly (0s) — on hide, only after the 380 ms fade-out,
+     so the space collapses after the content is gone. Show:
+     480 ms, ease-out cubic-bezier(.22,1,.36,1). Hide: 380 ms,
+     the same curve reversed. Inner elements cascade in with
+     40–60 ms stagger. Used for the proxy address/ports box
+     and for the split-tunnel controls. */
+  .reveal{overflow:hidden;max-height:0;opacity:0;visibility:hidden;
+    transform:translateY(-10px) scale(.97);pointer-events:none;
+    will-change:transform,opacity;
+    transition:transform .38s cubic-bezier(.64,0,.78,0),opacity .38s cubic-bezier(.64,0,.78,0),
+      visibility 0s linear .38s,max-height 0s linear .38s}
+  .reveal.show{max-height:320px;opacity:1;visibility:visible;transform:none;pointer-events:auto;
+    transition:transform .48s cubic-bezier(.22,1,.36,1),opacity .48s cubic-bezier(.22,1,.36,1),
+      visibility 0s linear 0s,max-height 0s linear 0s}
+  .reveal > *{opacity:0;transform:translateY(8px);
+    transition:transform .38s cubic-bezier(.64,0,.78,0),opacity .38s cubic-bezier(.64,0,.78,0)}
+  .reveal.show > *{opacity:1;transform:none;
+    transition:transform .45s cubic-bezier(.22,1,.36,1),opacity .45s cubic-bezier(.22,1,.36,1)}
+  .reveal.show > *:nth-child(1){transition-delay:.05s}
+  .reveal.show > *:nth-child(2){transition-delay:.11s}
+  .reveal.show > *:nth-child(3){transition-delay:.17s}
+  .reveal.show > *:nth-child(4){transition-delay:.23s}
   @media (max-width:420px){
     .signup .ch{display:none}
     .connect{width:172px;height:172px}
@@ -231,9 +324,10 @@
       <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21.9 4.3 18.9 19c-.2 1-.8 1.2-1.7.8l-4.6-3.4-2.2 2.1c-.3.3-.5.5-1 .5l.3-4.6 8.4-7.6c.4-.3-.1-.5-.6-.2L7.1 12.4 2.7 11c-1-.3-1-1 .2-1.4l17.4-6.7c.8-.3 1.5.2 1.6 1.4z"/></svg>
       <span class="fa">عضویت</span><span class="ch">@ProxyArc</span>
     </a>
+    <button class="burger" id="burgerBtn" type="button" aria-label="Menu"><span></span><span></span><span></span></button>
   </header>
   <main>
-    <div class="status"><span class="pill" id="pill"><i></i><span id="pillTxt">Disconnected</span></span></div>
+    <div class="status"><span class="pill" id="pill"><i></i><span id="pillTxt">Disconnected</span></span><span class="modetag" id="modeTag">VPN</span></div>
     <div class="ipbox" id="ipbox">
       <div class="lbl">Your IP</div>
       <div class="ip" id="ipVal">Not connected</div>
@@ -266,6 +360,72 @@
     </div>
   </main>
 </div>
+<div class="backdrop" id="backdrop"></div>
+<aside class="panel" id="panel">
+  <div class="panel-head">
+    <b>Settings</b>
+    <button class="panel-close" id="panelClose" type="button" aria-label="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+    </button>
+  </div>
+  <div class="panel-body">
+    <section>
+      <div class="psec-title">Connection Mode</div>
+      <div class="seg" id="modeSeg">
+        <button type="button" class="seg-btn active" data-mode="vpn">VPN</button>
+        <button type="button" class="seg-btn" data-mode="proxy">Proxy Mode</button>
+      </div>
+      <!-- sb12: the proxy on/off switch lives ONLY in the Proxy
+           Mode section — it is hidden entirely while VPN is
+           selected, so it can never be mistaken for a VPN
+           control. Tapping the Proxy Mode row only selects it;
+           only this switch activates proxy mode. -->
+      <div class="switch-row" id="proxySwitchRow" style="display:none">
+        <span class="switch-label">Proxy Mode</span>
+        <button type="button" class="switch" id="proxySwitch" role="switch" aria-checked="false" aria-label="Proxy mode"><span class="knob"></span></button>
+      </div>
+      <div class="psec-hint" id="modeHint">All phone traffic goes through the VPN tunnel.</div>
+      <!-- sb12: the proxy address/ports box animates in (fade +
+           slide + slight scale) only when proxy mode is actually
+           switched ON — never an instant show/hide. -->
+      <div class="reveal" id="proxyInfo">
+        <div class="psec-title">Proxy Address</div>
+        <div class="proxy-line"><span>SOCKS5</span><code>127.0.0.1:1080</code></div>
+        <div class="proxy-line"><span>HTTP</span><code>127.0.0.1:8080</code></div>
+        <div class="psec-hint">Enter this address as the proxy in other apps.</div>
+      </div>
+    </section>
+    <section id="splitSec">
+      <div class="psec-title">Split Tunneling</div>
+      <!-- sb12: its own ON/OFF switch. When ON, the mode
+           indicator + Choose Apps button animate in below. -->
+      <div class="switch-row">
+        <span class="switch-label">Enable split tunneling</span>
+        <button type="button" class="switch" id="splitSwitch" role="switch" aria-checked="false" aria-label="Split tunneling"><span class="knob"></span></button>
+      </div>
+      <div class="reveal" id="splitControls">
+        <div class="psec-hint" id="splitSummary">Off</div>
+        <button class="psec-btn" id="splitOpenBtn" type="button">Choose Apps</button>
+      </div>
+      <div class="psec-hint">Works in VPN mode only and applies on the next connection.</div>
+    </section>
+  </div>
+  <div class="appview" id="appView">
+    <div class="appview-head">
+      <button class="appview-back" id="appBack" type="button">‹ Back</button>
+      <b>Apps</b>
+    </div>
+    <!-- sb12: only Bypass and Only here — Off lives only on
+         the split-tunnel toggle in the panel now. -->
+    <div class="seg" id="splitSeg">
+      <button type="button" class="seg-btn" data-split="bypass">Bypass</button>
+      <button type="button" class="seg-btn" data-split="only">Only</button>
+    </div>
+    <input class="app-search" id="appSearch" type="search" placeholder="Search apps…" />
+    <div class="app-list" id="appList"></div>
+    <button class="app-save" id="appSave" type="button">Save</button>
+  </div>
+</aside>
 <script>
 (function(){
   "use strict";
@@ -332,7 +492,7 @@
       el.type = 'button';
       el.setAttribute('data-code', s.code);
       el.className = 'srv' + (s.code === sel.code ? ' sel' : '');
-      var em = s.code === 'fastest' ? 'Auto — picks the best server' : s.code + ' · ' + s.ip;
+      var em = s.code === 'fastest' ? 'Auto — picks the best server · auto-switch on' : s.code + ' · ' + s.ip;
       el.innerHTML =
         '<span class="f">' + s.flag + '</span>' +
         '<span class="n"><b>' + s.country + ' — ' + s.city + '</b><em>' + em + '</em></span>' +
@@ -375,7 +535,19 @@
     var changed = s.code !== sel.code;
     sel = s; render(); paint(); open(false);
     if(!changed) return;
-    if(state === 'on'){ pendingReconnect = true; disconnect(); }
+    // sb14: remember the last server the user picked — the app
+    // reopens on it (Fastest stays Fastest).
+    try{ AndroidBridge.saveLastSelection(s.code); }catch(e){}
+    if(state === 'on'){ pendingReconnect = true; disconnect(); return; }
+    // sb14: tapping a DIFFERENT server while connecting cancels
+    // the in-flight connect (its epoch is bumped, so it aborts
+    // silently) and connects to the new one. Tapping the same
+    // server while busy does nothing (!changed above).
+    if(state === 'busy'){
+      try{ AndroidBridge.cancelConnect(); }catch(e){}
+      setState('idle');
+      connect();
+    }
   }
   function setState(k){
     state = k;
@@ -423,17 +595,52 @@
     try{
       if(typeof AndroidBridge === 'undefined') return;
       var s = JSON.parse(AndroidBridge.getStatusJson());
+      // sb11: keep the side panel's mode in sync with the
+      // persisted setting (e.g. after a mode switch), and
+      // always show the active mode next to the status pill,
+      // so the user can never be in a mode without noticing.
+      // sb14: only curMode syncs here — the DISPLAYED section
+      // (selMode) never follows the active mode, or the panel
+      // would jump sections when a switch flips.
+      if(s.mode && s.mode !== curMode){ curMode = s.mode; paintMode(); }
+      $('modeTag').textContent = s.mode === 'proxy' ? 'Proxy' : 'VPN';
       if(s.connected){
         if(state !== 'on') setState('on');
         showIp(s.ip, s.regionCode);
+        // sb11: the connected server's ping is the RTT ping (a
+        // request/response on an established CONNECT tunnel, ~1
+        // RTT — what Speedtest measures). Overwrites the
+        // pre-connect ping for this region while connected; -1
+        // means not measured yet, leave the old value alone.
+        // (The Clash API delay is never shown as the ping now.)
+        if(s.sbPingMs > 0 && s.regionCode){
+          if(pings[s.regionCode] !== s.sbPingMs){
+            pings[s.regionCode] = s.sbPingMs;
+            var sp = document.querySelector('[data-ping-for="' + s.regionCode + '"]');
+            if(sp){ sp.textContent = pingText(s.regionCode); sp.className = pingClass(s.regionCode); }
+            var fp = document.querySelector('[data-ping-for="fastest"]');
+            if(fp){ fp.textContent = pingText('fastest'); fp.className = pingClass('fastest'); }
+          }
+        }
         var total = (s.txBytes || 0) + (s.rxBytes || 0);
         var now = Date.now();
         if(prevBytes < 0){ prevBytes = total; lastBytesChange = now; }
         else if(total !== prevBytes){ prevBytes = total; lastBytesChange = now; stallReported = false; }
-        else if(!stallReported && s.connectedAt > 0 && now - s.connectedAt > 60000 && now - lastBytesChange > 30000){
+        // sb9: NEVER auto-optimize on a dead stats stream — the
+        // sing-box byte counters stay 0 forever if the status
+        // stream never delivers, and firing optimize on that is
+        // the reported "server disconnects by itself". Only a
+        // stall AFTER real traffic was seen (s.statsLive) counts.
+        else if(!stallReported && s.statsLive && s.connectedAt > 0 && now - s.connectedAt > 60000 && now - lastBytesChange > 30000){
           stallReported = true;
           try{ AndroidBridge.optimize(); }catch(e){}
         }
+        // sb15: a real underlying-network change (debounced in
+        // Java) re-establishes the tunnel — Fastest re-tests and
+        // takes the best server, a fixed region reconnects to the
+        // same server. Proxy mode, disconnected and connecting
+        // are all no-ops in Java.
+        try{ AndroidBridge.pollNetworkChange(); }catch(e){}
       } else if(s.state === 'connecting'){
         if(state !== 'busy') setState('busy');
       } else {
@@ -442,6 +649,327 @@
       }
     }catch(e){}
   }
+  // ---------- sb10: hamburger side panel ----------
+  var curMode = 'vpn', selMode = 'vpn', splitMode = 'off', splitLastMode = 'bypass', splitPkgs = [], allApps = null, splitLoaded = false, iconCache = {};
+  function escHtml(s){
+    return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  // sb11: selection (selMode — which row is highlighted and
+  // whose details are shown) is separate from activation
+  // (curMode — the persisted mode, changed ONLY by the proxy
+  // switch). Tapping a mode row never activates anything.
+  // sb14: selMode is the DISPLAYED panel section only — it
+  // changes ONLY when the user taps a section row, or on the
+  // very first load (where it starts as the active mode). It
+  // is NEVER changed by a toggle/switch: flipping the proxy
+  // switch OFF must NOT jump the panel to the VPN section.
+  // curMode is the ACTIVE mode; the mode tag shows it.
+  function paintMode(){
+    var btns = document.querySelectorAll('#modeSeg .seg-btn');
+    for(var i = 0; i < btns.length; i++){
+      btns[i].classList.toggle('active', btns[i].getAttribute('data-mode') === selMode);
+    }
+    var on = curMode === 'proxy';
+    $('proxySwitch').classList.toggle('on', on);
+    $('proxySwitch').setAttribute('aria-checked', String(on));
+    // sb14: the hint describes the DISPLAYED section, and says
+    // whether proxy mode is actually on or off — the panel no
+    // longer jumps sections when the switch flips.
+    $('modeHint').textContent = selMode === 'proxy'
+      ? (on ? 'Proxy mode is on — a local proxy runs on the phone.'
+            : 'Turn on the Proxy Mode switch to run a local proxy instead of the VPN.')
+      : 'All phone traffic goes through the VPN tunnel.';
+    // sb12: the proxy switch lives ONLY in the Proxy Mode
+    // section — hidden entirely while VPN is selected.
+    $('proxySwitchRow').style.display = selMode === 'proxy' ? '' : 'none';
+    // sb12: the proxy address/ports box animates in only when
+    // proxy mode is actually ON (fade + slide + slight scale).
+    $('proxyInfo').classList.toggle('show', selMode === 'proxy' && on);
+    // sb13: each control lives only in its own section — the
+    // split-tunnel section is shown only while VPN is
+    // selected; while Proxy Mode is selected it is hidden
+    // entirely (the proxy switch is likewise hidden while
+    // VPN is selected). The mode buttons (VPN / Proxy Mode)
+    // always stay visible, so the user can always reach
+    // either control. The split controls are never disabled
+    // now: tapping split ON while proxy is ON auto-turns
+    // proxy OFF (see the split switch handler).
+    $('splitSec').style.display = selMode === 'proxy' ? 'none' : '';
+  }
+  function paintSplit(){
+    var n = splitPkgs.length;
+    var on = splitMode !== 'off';
+    // sb12: the split toggle mirrors the state; the mode
+    // indicator + Choose Apps button animate in when ON.
+    $('splitSwitch').classList.toggle('on', on);
+    $('splitSwitch').setAttribute('aria-checked', String(on));
+    $('splitControls').classList.toggle('show', on);
+    $('splitSummary').textContent =
+      splitMode === 'off' ? 'Off' :
+      splitMode === 'bypass' ? (n ? n + ' apps bypass the VPN' : 'Bypass — no apps selected yet') :
+      (n ? 'Only ' + n + ' apps use the VPN' : 'Only — no apps selected yet');
+    var btns = document.querySelectorAll('#splitSeg .seg-btn');
+    for(var i = 0; i < btns.length; i++){
+      btns[i].classList.toggle('active', btns[i].getAttribute('data-split') === splitMode);
+    }
+  }
+  // sb14: the saved last server is applied only on the very
+  // first load. Reopening the panel must never re-select
+  // over the live session — and must never move the section
+  // the user was looking at.
+  var settingsFirstLoad = true;
+  function loadSettings(){
+    try{
+      var s = JSON.parse(AndroidBridge.getSettings());
+      curMode = s.mode === 'proxy' ? 'proxy' : 'vpn';
+      splitMode = s.splitMode || 'off';
+      splitLastMode = s.splitLastMode === 'only' ? 'only' : 'bypass';
+      splitPkgs = s.splitPackages || [];
+      // sb13: mutual exclusivity, deterministic rule — if the
+      // saved settings somehow have BOTH proxy mode and split
+      // tunneling ON, keep split tunnel ON and turn proxy OFF,
+      // and persist the correction so Java agrees. (Checked
+      // BEFORE the first-load section init below, so the
+      // panel opens on the corrected active mode.)
+      if(curMode === 'proxy' && splitMode !== 'off'){
+        curMode = 'vpn';
+        try{ AndroidBridge.setMode('vpn'); }catch(e){}
+      }
+      if(settingsFirstLoad){
+        settingsFirstLoad = false;
+        selMode = curMode;
+        // sb14: reopen on the LAST server the user picked
+        // ("fastest", or nothing saved, stays Fastest).
+        // regionFor() only matches the known server list, so
+        // a stale saved code safely falls back to Fastest.
+        var ls = s.lastSelection || 'fastest';
+        if(ls && ls !== 'fastest'){
+          var r = regionFor(ls);
+          if(r) sel = r;
+        }
+      }
+    }catch(e){}
+    paintMode(); paintSplit();
+  }
+  function setPanel(v){
+    document.body.classList.toggle('panel-open', v);
+    $('burgerBtn').classList.toggle('open', v);
+    if(v){ loadSettings(); }
+    // Closing the panel also closes the app list inside it,
+    // so the Back-button depth count stays exact.
+    if(!v){ $('appView').classList.remove('show'); }
+    syncOverlayDepth();
+  }
+  // sb12: Back must close the topmost overlay (app list, then
+  // the panel) instead of exiting the app. The depth is kept
+  // in sync with Java through setOverlayDepth.
+  function syncOverlayDepth(){
+    var d = 0;
+    if(document.body.classList.contains('panel-open')) d++;
+    if($('appView').classList.contains('show')) d++;
+    try{ AndroidBridge.setOverlayDepth(d); }catch(e){}
+  }
+  window.__closeTopOverlay = function(){
+    if($('appView').classList.contains('show')){
+      $('appView').classList.remove('show');
+    } else if(document.body.classList.contains('panel-open')){
+      setPanel(false);
+    }
+    syncOverlayDepth();
+  };
+  $('burgerBtn').addEventListener('click', function(){ setPanel(!document.body.classList.contains('panel-open')); });
+  $('backdrop').addEventListener('click', function(){ setPanel(false); });
+  $('panelClose').addEventListener('click', function(){ setPanel(false); });
+  document.querySelectorAll('#modeSeg .seg-btn').forEach(function(b){
+    b.addEventListener('click', function(){
+      var m = b.getAttribute('data-mode');
+      if(m === 'vpn'){
+        // sb13: tapping VPN only SELECTS it (shows the VPN
+        // section) — it does NOT change the active mode. The
+        // active mode changes only via the proxy switch
+        // (OFF = VPN) or via the split toggle (turning split
+        // ON auto-turns proxy OFF). This keeps the
+        // mutual-exclusivity flow reachable: proxy can stay
+        // ON while the user looks at the VPN section and
+        // flips split ON — and the proxy then auto-turns off.
+        selMode = 'vpn';
+      } else {
+        // sb12: tapping Proxy Mode ONLY selects it (highlight +
+        // details) — it must NOT activate the mode, so an
+        // accidental tap can never leave the user in proxy mode
+        // unnoticed. Activation is only via the switch below.
+        selMode = 'proxy';
+      }
+      paintMode();
+    });
+  });
+  // sb11: the proxy switch is the ONLY way to change the active
+  // mode. ON = proxy mode, OFF = VPN mode. Switching while
+  // connected disconnects first; the next connect uses the
+  // new mode.
+  $('proxySwitch').addEventListener('click', function(){
+    var m = curMode === 'proxy' ? 'vpn' : 'proxy';
+    // sb13: proxy mode and split tunneling are mutually
+    // exclusive — turning proxy ON auto-turns split OFF
+    // (its controls animate out; the state is persisted).
+    if(m === 'proxy' && splitMode !== 'off'){
+      splitLastMode = splitMode;
+      splitMode = 'off';
+      try{ AndroidBridge.saveSplitTunnel('off', JSON.stringify(splitPkgs)); }catch(e){}
+      paintSplit();
+    }
+    if(state === 'on'){ disconnect(); }
+    // sb14: the switch changes the ACTIVE mode only — it never
+    // moves the DISPLAYED section, so flipping it OFF leaves
+    // the panel on the Proxy Mode section (no jump to VPN).
+    curMode = m;
+    try{ AndroidBridge.setMode(m); }catch(e){}
+    paintMode();
+  });
+  // sb13: the split toggle is the ONLY on/off for split
+  // tunneling, and it is mutually exclusive with proxy
+  // mode — turning split ON while proxy is ON auto-turns
+  // proxy OFF (disconnect first if connected; the proxy
+  // switch goes off, its IP/port box animates out, the
+  // mode tag switches to VPN, and the change is persisted).
+  // ON restores the last used mode (Bypass by default);
+  // OFF turns split tunneling off entirely.
+  $('splitSwitch').addEventListener('click', function(){
+    if(splitMode === 'off'){
+      if(curMode === 'proxy'){
+        if(state === 'on'){ disconnect(); }
+        // sb14: turning split ON auto-turns proxy OFF, but the
+        // DISPLAYED section does not move — it is already VPN
+        // here (the split toggle is only visible in the VPN
+        // section), so there is nothing to jump to.
+        curMode = 'vpn';
+        try{ AndroidBridge.setMode('vpn'); }catch(e){}
+      }
+      splitMode = splitLastMode || 'bypass';
+    } else {
+      splitLastMode = splitMode;
+      splitMode = 'off';
+    }
+    try{ AndroidBridge.saveSplitTunnel(splitMode, JSON.stringify(splitPkgs)); }catch(e){}
+    paintMode(); paintSplit();
+  });
+  // Split tunneling app list (sub-view inside the panel).
+  function renderAppList(q){
+    var list = $('appList'); list.innerHTML = '';
+    var query = (q || '').trim().toLowerCase();
+    var rows = [];
+    (allApps || []).forEach(function(a){
+      if(query && a.label.toLowerCase().indexOf(query) < 0 && a.package.toLowerCase().indexOf(query) < 0) return;
+      rows.push(a);
+    });
+    // sb11: selected apps first (each group alphabetical), so
+    // a chosen app is never buried at the bottom of the list.
+    rows.sort(function(a, b){
+      var as = splitPkgs.indexOf(a.package) >= 0 ? 0 : 1;
+      var bs = splitPkgs.indexOf(b.package) >= 0 ? 0 : 1;
+      if(as !== bs) return as - bs;
+      var al = (a.label || '').toLowerCase(), bl = (b.label || '').toLowerCase();
+      return al < bl ? -1 : al > bl ? 1 : 0;
+    });
+    if(!rows.length){ list.innerHTML = '<div class="app-empty">No apps found</div>'; return; }
+    rows.forEach(function(a){
+      var row = document.createElement('label');
+      row.className = 'app-row';
+      // Placeholder = the app's first letter (a letter or digit
+      // only — never an emoji); the real icon replaces it once
+      // loaded. An empty placeholder is just a plain tile.
+      var ch = (a.label || '').charAt(0);
+      var ph = /[\p{L}\p{N}]/u.test(ch) ? escHtml(ch) : '';
+      row.innerHTML = '<input type="checkbox"' + (splitPkgs.indexOf(a.package) >= 0 ? ' checked' : '') + ' data-pkg="' + escHtml(a.package) + '">' +
+        '<span class="app-ico-wrap"><span class="app-ico-ph">' + ph + '</span><img class="app-ico" alt="" style="display:none"></span>' +
+        '<span class="app-name">' + escHtml(a.label) + '</span>' +
+        '<span class="app-pkg">' + escHtml(a.package) + '</span>';
+      list.appendChild(row);
+    });
+    loadAppIcons();
+  }
+  // sb11: load the real app icons lazily, a few rows per tick,
+  // from the bridge (getAppIcon) — the list never freezes
+  // while icons load. Icons are cached per package, so a
+  // re-render (search, save) does not fetch them again.
+  function loadAppIcons(){
+    var rows = document.querySelectorAll('#appList .app-row');
+    var i = 0;
+    function tick(){
+      var n = 0;
+      while(i < rows.length && n < 6){
+        var row = rows[i++]; n++;
+        var img = row.querySelector('.app-ico');
+        if(!img || img.getAttribute('data-done')) continue;
+        var cb = row.querySelector('input[type=checkbox]');
+        var pkg = cb ? cb.getAttribute('data-pkg') : '';
+        if(!pkg) continue;
+        img.setAttribute('data-done', '1');
+        if(iconCache[pkg]){
+          img.src = iconCache[pkg];
+          img.style.display = '';
+          var ph0 = row.querySelector('.app-ico-ph');
+          if(ph0) ph0.style.display = 'none';
+          continue;
+        }
+        try{
+          var uri = AndroidBridge.getAppIcon(pkg);
+          if(uri){
+            iconCache[pkg] = uri;
+            img.src = uri;
+            img.style.display = '';
+            var ph1 = row.querySelector('.app-ico-ph');
+            if(ph1) ph1.style.display = 'none';
+          }
+        }catch(e){}
+      }
+      if(i < rows.length) window.setTimeout(tick, 30);
+    }
+    tick();
+  }
+  $('splitOpenBtn').addEventListener('click', function(){
+    if(curMode === 'proxy') return;
+    if(!splitLoaded){
+      splitLoaded = true;
+      try{ allApps = JSON.parse(AndroidBridge.getInstalledApps()); }catch(e){ allApps = []; }
+    }
+    $('appSearch').value = '';
+    renderAppList('');
+    $('appView').classList.add('show');
+    syncOverlayDepth();
+  });
+  $('appBack').addEventListener('click', function(){ $('appView').classList.remove('show'); syncOverlayDepth(); });
+  $('appSearch').addEventListener('input', function(){ renderAppList(this.value); });
+  document.querySelectorAll('#splitSeg .seg-btn').forEach(function(b){
+    b.addEventListener('click', function(){ splitMode = b.getAttribute('data-split'); paintSplit(); });
+  });
+  $('appSave').addEventListener('click', function(){
+    var pkgs = [];
+    var boxes = document.querySelectorAll('#appList input[type=checkbox]:checked');
+    for(var i = 0; i < boxes.length; i++){ pkgs.push(boxes[i].getAttribute('data-pkg')); }
+    splitPkgs = pkgs;
+    if(splitMode !== 'off') splitLastMode = splitMode;
+    // sb13: belt and braces for mutual exclusivity — saving
+    // a non-off split mode while proxy is ON auto-turns
+    // proxy OFF (cannot normally happen: the app list is
+    // only reachable while split is ON, which already
+    // implies proxy is OFF).
+    // sb14: only the ACTIVE mode changes here — the DISPLAYED
+    // section stays where the user was looking.
+    if(splitMode !== 'off' && curMode === 'proxy'){
+      if(state === 'on'){ disconnect(); }
+      curMode = 'vpn';
+      try{ AndroidBridge.setMode('vpn'); }catch(e){}
+    }
+    try{ AndroidBridge.saveSplitTunnel(splitMode, JSON.stringify(pkgs)); }catch(e){}
+    paintMode(); paintSplit();
+    $('appView').classList.remove('show');
+    syncOverlayDepth();
+  });
+  // sb14: loadSettings() FIRST — it applies the saved last
+  // server to `sel` before the first render, so the app
+  // reopens on the user's last pick (or Fastest by default).
+  loadSettings();
   render(); paint(); setState('idle');
   setInterval(poll, 1000);
   try{ AndroidBridge.checkExitIp(); }catch(e){}

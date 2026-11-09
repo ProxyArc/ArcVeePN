@@ -18,8 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * the VeePN HTTPS upstream (Upstream.connectViaServer).
  * UDP ASSOCIATE relays DNS (port 53) as DNS-over-TCP through the
  * tunnel; other UDP is dropped, exactly like desktop VPeeN.
- * Note: with hev's mapdns, most DNS never reaches here at all:
- * hev maps names to fake IPs and sends domain CONNECTs instead.
+ * Note: in the sing-box build, normal app DNS never reaches here
+ * at all: sing-box hijacks DNS to its own DoH resolver.
  */
 public class LocalSocksServer {
     public static final int SOCKS_PORT = 1080;
@@ -184,7 +184,7 @@ public class LocalSocksServer {
                     System.arraycopy(ip, 0, hdr, 4, 16);
                     hdr[20] = (byte) ((port >> 8) & 0xFF); hdr[21] = (byte) (port & 0xFF);
                 } else {
-                    // Reply with the queried host as a domain (hev accepts it).
+                    // Reply with the queried host as a domain.
                     byte[] hb = host.getBytes(StandardCharsets.UTF_8);
                     hdr = new byte[5 + hb.length + 2];
                     hdr[3] = 3; hdr[4] = (byte) hb.length;
