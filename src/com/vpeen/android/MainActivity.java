@@ -85,7 +85,6 @@ import java.util.concurrent.*;
 public class MainActivity extends Activity {
     private static final int REQ_VPN = 1001;
     private static final int REQ_NOTIF = 1002;
-    private static final long CACHE_TTL_MS = 60000;
 
     // sb11 RTT ping (replaces the sb10 CONNECT-time ping): sb10
     // timed connection SETUP (DNS + TCP + TLS handshake + CONNECT
@@ -100,13 +99,45 @@ public class MainActivity extends Activity {
     // shown as the ping (it measures a full HTTPS fetch — the
     // same multi-RTT error); Clash stays only for sing-box's
     // internal urltest use.
-    private static final int RTT_TIMEOUT_MS = 8000;
-    private static final int PING_MAX_PER_REGION = 2;
-    private static final int TCP_TIMEOUT_MS = 2500;
 
     private WebView webView;
-    private String pendingRegion;
-    private String pendingDisplay;
+    // Server (TEST): pending connect while the VPN permission
+    // dialog is up, and the last fetched Server server list
+    // (passwords stay in these objects only — never sent to
+    // the WebView; the 30-min fetch cache lives in SubscriptionApi).
+    private String pendingIp;
+    private String pendingFlag;
+    private String pendingProto;
+    private volatile List<Server> serverCache;
+    // Server v2: per-server TCP ping results + Fastest
+    // live-switch. serverPingMs holds the last sweep's result
+    // per IP (ms, or -1 when the server did not answer);
+    // failedIps are servers a Fastest connect already
+    // tried and failed, so the next-best is tried instead.
+    private static final int PING_TIMEOUT_MS = 3000;
+    // Local proxy ports (were the removed Java bridge's
+    // SOCKS_PORT / HTTP_PORT — sing-box serves these ports
+    // itself in both modes now).
+    private static final int SOCKS_PORT = 1080;
+    private static final int HTTP_PORT = 8080;
+    private static final long FASTEST_MIN_GAIN_MS = 20;
+    private final Map<String, Long> serverPingMs = new ConcurrentHashMap<>();
+    private final java.util.Set<String> failedIps =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+    private volatile Thread pingThread = null;
+    private volatile boolean fastestServer = false;
+    private volatile long fastestServerEpoch = 0;
+    private volatile String serverBestIp = null;
+    private volatile long serverBestMs = Long.MAX_VALUE;
+    private volatile String connectedServerIp = null;
+    private volatile long connectedServerMs = Long.MAX_VALUE;
+    private volatile boolean pendingFastest = false;
+    // v8: cached-list state. ssCacheLoaded is true when the
+    // SS list on screen came from the offline cache (the
+    // fresh fetch is still running or failed); the same
+    // flag is reported to the WebView so the user can see
+    // the list is cached, not live.
+    private volatile boolean ssCacheLoaded = false;
     private volatile String lastIp = "—";
     private volatile String lastError = "";
     private volatile boolean connecting = false;
@@ -135,9 +166,6 @@ public class MainActivity extends Activity {
     // outbound), polled while connected; -1 = not measured yet.
     private volatile long lastSbPingMs = -1;
     private volatile Thread sbPingThread = null;
-    // sb9: true while the current connect flow is Fastest, so the
-    // service routes through the sing-box urltest group.
-    private volatile boolean fastestModeFlag = false;
 
     // sb15: Fastest periodic re-test + auto-switch. While
     // connected in VPN mode on Fastest, re-test all regions every
@@ -148,12 +176,6 @@ public class MainActivity extends Activity {
     private static final long FASTEST_RETEST_INTERVAL_MS = 5L * 60 * 1000;
     private static final long FASTEST_SWITCH_MIN_GAIN_MS = 30;
     private volatile Thread fastestRetestThread = null;
-
-    private static class CachedServers {
-        List<Server> servers; long at;
-        CachedServers(List<Server> s, long a) { servers = s; at = a; }
-    }
-    private final Map<String, CachedServers> serverCache = new ConcurrentHashMap<>();
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
@@ -262,65 +284,177 @@ public class MainActivity extends Activity {
         return "'" + s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'";
     }
 
-    private static String flagFor(String code) {
-        if (code == null || code.length() < 2) return "";
-        String c = code.toUpperCase();
-        return new String(Character.toChars(127397 + c.charAt(0)))
-                + new String(Character.toChars(127397 + c.charAt(1)));
-    }
-
     public class Bridge {
+        /** SS-only refresh — the single entry point for
+         *  app open and the refresh button. Every refresh tries
+         *  the PRIMARY subscription first; SubscriptionApi already
+         *  falls back to the BACKUP (emergency) subscription
+         *  inside fetchServers when the primary fails (network
+         *  / HTTP / empty / zero parseable servers), and the
+         *  next refresh tries the primary first again. On
+         *  success the raw subscription is saved to the
+         *  offline cache and the SS list is shown. When BOTH
+         *  subscriptions yield 0 usable servers, the WebView
+         *  KEEPS the list it already has (the cached list shown
+         *  on open) — the dropdown is never emptied by a
+         *  failed refresh. The same {ip, flag, port, proto,
+         *  name} payload as refreshServers, never the password. */
+        /** Open a URL outside the app (browser / Telegram).
+         *  The new UI's "Project on GitHub" button and the
+         *  Telegram join link use this — the WebViewClient
+         *  only intercepts tg:// and t.me/ URLs, so a plain
+         *  https:// link would otherwise load INSIDE the
+         *  WebView and navigate away from the app UI. */
         @JavascriptInterface
-        public void refreshLocations() {
-            new Thread(() -> {
-                try {
-                    VeePnApi api = new VeePnApi(MainActivity.this);
-                    List<Location> list = api.locations();
-                    JSONArray arr = new JSONArray();
-                    for (Location l : list) {
-                        JSONObject o = new JSONObject();
-                        o.put("region", l.region);
-                        o.put("countryCode", l.countryCode);
-                        o.put("name", l.name);
-                        o.put("id", l.id);
-                        o.put("flag", flagFor(l.countryCode));
-                        arr.put(o);
-                    }
-                    eval("window.onLocations(" + jsString(arr.toString()) + ")");
-                } catch (Throwable e) {
-                    // sb15 (no-logs audit): the locations handler
-                    // does not exist in the page (no-op), and raw
-                    // exception text must never reach the UI.
-                    eval("window.onLocationsError("
-                            + jsString("Could not load server list.") + ")");
-                }
-            }).start();
+        public void openExternal(final String url) {
+            try {
+                if (url == null) return;
+                String u = url.trim();
+                if (!u.startsWith("http://") && !u.startsWith("https://") && !u.startsWith("tg://")) return;
+                final android.net.Uri uri = android.net.Uri.parse(u);
+                runOnUiThread(() -> {
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                    } catch (Throwable ignored) {}
+                });
+            } catch (Throwable ignored) {}
         }
 
         @JavascriptInterface
-        public void connect(final String region, final String display) {
-            runOnUiThread(() -> {
-                // sb15 HARDENING: this runs on the UI thread — an
-                // exception here (VpnService.prepare /
-                // startActivityForResult) would be uncaught on the
-                // main thread and kill the process. Everything is
-                // guarded; the failure shows only the generic error.
+        public void refreshServersForce() {
+            new Thread(() -> {
                 try {
-                    // DIAG (sb3d): fresh connect log for this attempt.
+                    try {
+                        SubscriptionApi.refresh();
+                        List<Server> list = new SubscriptionApi().fetchServers();
+                        serverCache = list;
+                        ssCacheLoaded = false;
+                        // v8: persist the raw subscription for
+                        // the offline cache (raw text, not the
+                        // password).
+                        try {
+                            String cacheJson = SubscriptionApi.lastFetchForCache();
+                            if (cacheJson != null)
+                                AppSettings.saveCachedSs(MainActivity.this, cacheJson);
+                        } catch (Throwable ignored) {}
+                        JSONArray arr = new JSONArray();
+                        for (Server a : list) {
+                            JSONObject o = new JSONObject();
+                            o.put("ip", a.ip);
+                            o.put("flag", a.flag == null ? "" : a.flag);
+                            o.put("port", a.port);
+                            o.put("proto", a.proto == null ? "ss" : a.proto);
+                            o.put("name", a.name == null ? "" : a.name);
+                            arr.put(o);
+                        }
+                        eval("window.onServers(" + jsString(arr.toString()) + ")");
+                    } catch (Throwable e) {
+                        // Both subscriptions yielded nothing —
+                        // keep the cached list on screen.
+                        eval("window.onServersError("
+                                + jsString("Could not load servers.") + ")");
+                    }
+                } catch (Throwable ignored) {}
+            }).start();
+        }
+        /** The CACHED Shadowsocks list, shown IMMEDIATELY
+         *  on app open while the fresh fetch runs in the
+         *  background. Returns {"cached":true|false,
+         *  "servers":[{ip,flag,port,proto,name}]} — the same
+         *  payload shape as onServers. "cached" is false
+         *  (and servers empty) when the app has never fetched
+         *  successfully. The SS cache is re-parsed with the
+         *  subscription bucket-roll refresh, so a cached SS server
+         *  stays valid after the credential bucket rolls. */
+        @JavascriptInterface
+        public String getCachedServers() {
+            try {
+                JSONObject out = new JSONObject();
+                List<Server> list = loadSsCache();
+                out.put("cached", !list.isEmpty());
+                JSONArray arr = new JSONArray();
+                for (Server a : list) {
+                    JSONObject o = new JSONObject();
+                    o.put("ip", a.ip);
+                    o.put("flag", a.flag == null ? "" : a.flag);
+                    o.put("port", a.port);
+                    o.put("proto", a.proto == null ? "ss" : a.proto);
+                    o.put("name", a.name == null ? "" : a.name);
+                    arr.put(o);
+                }
+                out.put("servers", arr);
+                if (!list.isEmpty()) {
+                    serverCache = list;
+                    ssCacheLoaded = true;
+                }
+                return out.toString();
+            } catch (Throwable ignored) {
+                return "{\"cached\":false,\"servers\":[]}";
+            }
+        }
+
+        /** Server v2: start a TCP-connect ping sweep over the
+         *  Server servers. Results stream to the WebView live
+         *  (onServerPing per server, onServerPingDone at the
+         *  end); a sweep already running is not started twice. */
+        @JavascriptInterface
+        public void pingServers() {
+            startServerPingSweep();
+        }
+
+        /** Connect to one subscription server by IP + protocol
+         *  ("ss" primary, "vmess" backup). Mirrors connect():
+         *  proxy mode needs no VPN permission, otherwise the
+         *  VpnService.prepare flow with pendingIp/
+         *  pendingFlag/pendingProto (handled in
+         *  onActivityResult, like pendingRegion/pendingDisplay).
+         *  The actual connect runs on a background thread in
+         *  doConnect. */
+        @JavascriptInterface
+        public void connectServer(final String ip, final String flag, final String proto) {
+            runOnUiThread(() -> {
+                try {
                     try { ConnectLog.clear(MainActivity.this); } catch (Throwable ignored) {}
-                    // sb10: proxy mode runs no TUN at all — no VPN
-                    // permission is needed (and no VPN key icon shows).
                     if (AppSettings.isProxyMode(MainActivity.this)) {
-                        doConnect(region, display, null);
+                        doConnect(ip, flag, proto);
                         return;
                     }
                     Intent prep = VpnService.prepare(MainActivity.this);
                     if (prep != null) {
-                        pendingRegion = region;
-                        pendingDisplay = display;
+                        pendingIp = ip;
+                        pendingFlag = flag;
+                        pendingProto = proto;
                         startActivityForResult(prep, REQ_VPN);
                     } else {
-                        doConnect(region, display, null);
+                        doConnect(ip, flag, proto);
+                    }
+                } catch (Throwable t) {
+                    lastError = "Connection failed.";
+                    connecting = false;
+                    eval("window.onConnectError(" + jsString(lastError) + ")");
+                }
+            });
+        }
+
+        /** Server v2: Fastest mode — ping-test all servers and
+         *  switch live to the best found so far. Same VPN
+         *  permission flow as connectServer (pendingFastest
+         *  is resumed in onActivityResult). */
+        @JavascriptInterface
+        public void connectFastest() {
+            runOnUiThread(() -> {
+                try {
+                    try { ConnectLog.clear(MainActivity.this); } catch (Throwable ignored) {}
+                    if (AppSettings.isProxyMode(MainActivity.this)) {
+                        doConnectFastest();
+                        return;
+                    }
+                    Intent prep = VpnService.prepare(MainActivity.this);
+                    if (prep != null) {
+                        pendingFastest = true;
+                        startActivityForResult(prep, REQ_VPN);
+                    } else {
+                        doConnectFastest();
                     }
                 } catch (Throwable t) {
                     lastError = "Connection failed.";
@@ -338,6 +472,13 @@ public class MainActivity extends Activity {
             connecting = false;
             lastError = "";
             watchdogStop = true;
+            // Server v2: leaving Fastest mode + forget the
+            // connected Server server (bumping the fastest
+            // epoch stops any sweep from switching afterwards).
+            fastestServer = false;
+            fastestServerEpoch++;
+            connectedServerIp = null;
+            connectedServerMs = Long.MAX_VALUE;
             runOnUiThread(() -> {
                 // sb15 HARDENING: startService is guarded — an
                 // IllegalStateException here (app backgrounded)
@@ -366,39 +507,12 @@ public class MainActivity extends Activity {
                 startService(d);
             } catch (Throwable ignored) {}
         }
-
         @JavascriptInterface
         public void optimize() {
-            if (!VpnTunnelService.running) return;
-            long now = System.currentTimeMillis();
-            if (now - lastOptimizeAt < 60000) return;
-            lastOptimizeAt = now;
-            optimizeCount++;
-            if (currentRegionCode == null) return;
-            final String region = currentRegionCode;
-            final String display = currentDisplay;
-            final String exclude = VpnTunnelService.currentServer != null
-                    ? VpnTunnelService.currentServer.host() : null;
-            new Thread(() -> {
-                try {
-                    // sb14: observe the epoch, never bump it — a
-                    // user connect must always supersede this
-                    // auto-reconnect, and its fallback must not
-                    // run after being superseded.
-                    final long epoch = connectEpoch;
-                    Intent d = new Intent(MainActivity.this, VpnTunnelService.class);
-                    d.setAction(VpnTunnelService.ACTION_DISCONNECT);
-                    startService(d);
-                    Thread.sleep(1500);
-                    if (!epochAlive(epoch)) return;
-                    // Same region first; if it cannot connect at
-                    // all, fall back to Fastest across all regions.
-                    if (!connectRegionSync(region, display, exclude, epoch)) {
-                        if (!epochAlive(epoch)) return;
-                        doConnectFastest(false);
-                    }
-                } catch (Throwable ignored) {}
-            }).start();
+            // SS-only: a Shadowsocks tunnel is never
+            // "optimized" — the old v1.7 region re-test only
+            // made sense for the removed HTTP Proxy protocol.
+            // The watchdog still calls this; it is a no-op.
         }
 
         /** sb15: called from the JS 1 s poll while connected.
@@ -428,85 +542,13 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public void pingServers() {
-            // v1.7: real tunnel ping on launch again (tiny pages,
-            // not 500 KB), reported per region as it completes,
-            // with -1 for a region whose servers all fail — so
-            // the UI updates to ms or "—", never stuck on "ping…".
-            new Thread(() -> {
-                try {
-                    VeePnApi api = new VeePnApi(MainActivity.this);
-                    List<String> regions = new ArrayList<>();
-                    try {
-                        for (Location l : api.locations()) regions.add(l.region);
-                    } catch (Throwable ignored) {}
-                    if (regions.isEmpty()) {
-                        String[] fb = {"fr-prs", "gb-lnd", "nl", "ru-spb", "sg", "us-or", "us-va"};
-                        for (String r : fb) regions.add(r);
-                    }
-                    ExecutorService ex = Executors.newFixedThreadPool(Math.min(regions.size(), 7));
-                    for (String region : regions) {
-                        final String reg = region;
-                        ex.submit(() -> {
-                            // sb10: CONNECT-time ping only (no test
-                            // host anymore); the per-server retry
-                            // lives inside pingTestServers.
-                            // sb14: the launch ping test never
-                            // aborts (EPOCH_NONE).
-                            List<PingResult> res = pingRegion(api, reg, null, EPOCH_NONE);
-                            long best = res.isEmpty() ? -1 : res.get(0).ms;
-                            JSONArray arr = new JSONArray();
-                            try {
-                                JSONObject o = new JSONObject();
-                                o.put("code", reg);
-                                o.put("pingMs", best);
-                                arr.put(o);
-                            } catch (Throwable ignored) {}
-                            eval("window.onPings(" + jsString(arr.toString()) + ")");
-                        });
-                    }
-                    ex.shutdown();
-                } catch (Throwable ignored) {}
-            }).start();
-        }
-
-        @JavascriptInterface
-        public void connectFastest() {
-            runOnUiThread(() -> {
-                // sb15 HARDENING: same guard as connect() — this
-                // runs on the UI thread and must never throw.
-                try {
-                    // DIAG (sb3d): fresh connect log for this attempt.
-                    try { ConnectLog.clear(MainActivity.this); } catch (Throwable ignored) {}
-                    // sb10: proxy mode needs no VPN permission.
-                    if (AppSettings.isProxyMode(MainActivity.this)) {
-                        doConnectFastest();
-                        return;
-                    }
-                    Intent prep = VpnService.prepare(MainActivity.this);
-                    if (prep != null) {
-                        pendingRegion = "__fastest__";
-                        pendingDisplay = "Fastest — Auto";
-                        startActivityForResult(prep, REQ_VPN);
-                    } else {
-                        doConnectFastest();
-                    }
-                } catch (Throwable t) {
-                    lastError = "Connection failed.";
-                    connecting = false;
-                    eval("window.onConnectError(" + jsString(lastError) + ")");
-                }
-            });
-        }
-
-        @JavascriptInterface
         public void checkExitIp() {
             new Thread(() -> {
                 try {
                     String ip;
                     if (VpnTunnelService.running) {
                         Proxy proxy = new Proxy(Proxy.Type.SOCKS,
-                                new InetSocketAddress("127.0.0.1", LocalSocksServer.SOCKS_PORT));
+                                new InetSocketAddress("127.0.0.1", SOCKS_PORT));
                         HttpURLConnection c = (HttpURLConnection)
                                 new URL("https://api.ipify.org?format=json").openConnection(proxy);
                         c.setConnectTimeout(10000);
@@ -533,7 +575,12 @@ public class MainActivity extends Activity {
                 JSONObject o = new JSONObject();
                 boolean connected = VpnTunnelService.running;
                 if (connected) connecting = false;
-                if (connecting && System.currentTimeMillis() - connectingSince > 20000 && !connected) {
+                // Server v2: while a Fastest sweep is still
+                // testing, never auto-fail the connect — the
+                // sweep owns the outcome and reports it
+                // (onConnectError) when it ends.
+                boolean sweeping = pingThread != null && pingThread.isAlive();
+                if (connecting && !sweeping && System.currentTimeMillis() - connectingSince > 20000 && !connected) {
                     connecting = false;
                     if (lastError == null || lastError.isEmpty()) lastError = "Connection failed.";
                 }
@@ -573,9 +620,16 @@ public class MainActivity extends Activity {
                 o.put("mode", connected
                         ? (VpnTunnelService.proxyMode ? "proxy" : "vpn")
                         : AppSettings.getMode(MainActivity.this));
-                o.put("socksPort", LocalSocksServer.SOCKS_PORT);
-                o.put("httpPort", LocalSocksServer.HTTP_PORT);
+                o.put("socksPort", SOCKS_PORT);
+                o.put("httpPort", HTTP_PORT);
                 o.put("ip", lastIp);
+                // Server v2: connected Server server IP ("" when
+                // none), Fastest live-switch state, and whether
+                // a ping sweep is still testing.
+                o.put("serverIp", connectedServerIp == null ? "" : connectedServerIp);
+                o.put("fastestServer", fastestServer);
+                o.put("serverTesting", sweeping);
+                o.put("ssCached", ssCacheLoaded);
                 return o.toString();
             } catch (Throwable e) {
                 return "{}";
@@ -802,12 +856,21 @@ public class MainActivity extends Activity {
         try {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_VPN) {
-            if (resultCode == RESULT_OK && pendingRegion != null) {
-                String r = pendingRegion, d = pendingDisplay;
-                pendingRegion = null; pendingDisplay = null;
-                if ("__fastest__".equals(r)) doConnectFastest();
-                else doConnect(r, d, null);
+            if (resultCode == RESULT_OK && pendingIp != null) {
+                // Server: the VPN permission flow.
+                String ip = pendingIp, fl = pendingFlag, pr = pendingProto;
+                pendingIp = null; pendingFlag = null; pendingProto = null;
+                doConnect(ip, fl, pr);
+            } else if (resultCode == RESULT_OK && pendingFastest) {
+                // Server v2: Fastest was waiting on permission.
+                pendingFastest = false;
+                doConnectFastest();
             } else {
+                // Permission denied (or cancelled): drop any
+                // stale pending Server request so a later grant
+                // cannot resume the wrong one.
+                pendingIp = null; pendingFlag = null; pendingProto = null;
+                pendingFastest = false;
                 lastError = "VPN permission was not granted.";
                 eval("window.onConnectError(" + jsString(lastError) + ")");
             }
@@ -820,564 +883,398 @@ public class MainActivity extends Activity {
         }
     }
 
-    private List<Server> getServersCached(VeePnApi api, String region) throws Exception {
-        CachedServers c = serverCache.get(region);
-        long now = System.currentTimeMillis();
-        if (c != null && now - c.at < CACHE_TTL_MS) return c.servers;
-        List<Server> servers = api.serverList(region);
-        serverCache.put(region, new CachedServers(servers, now));
-        return servers;
-    }
-
-    // ---------- v1.7 real tunnel ping ----------
-
-    private static class PingResult {
-        Server server; String region; long ms;
-        PingResult(Server s, String r, long m) { server = s; region = r; ms = m; }
-    }
-
-    private static class ConnectCandidate {
-        Server server; String region; String display;
-        ConnectCandidate(Server s, String r, String d) { server = s; region = r; display = d; }
-    }
-
-    /** sb11 RTT ping through one server's upstream — measures
-     *  what Speedtest measures. The CONNECT tunnel is
-     *  established ONCE (untimed setup: DNS + TCP + TLS +
-     *  CONNECT 200, which already proves the proxy carries
-     *  traffic), then a minimal GET is timed to its first
-     *  response byte on that established tunnel: ~1 RTT through
-     *  the proxy, like Speedtest's latency. Returns ms, or -1
-     *  if the server cannot carry real traffic at all. The
-     *  overall timeout is enforced with a Future because
-     *  Upstream uses 10 s socket timeouts internally; the probe
-     *  runs on a daemon thread so an abandoned attempt can never
-     *  block the pool. */
-    private long rttPingMs(Server s) {
-        ExecutorService one = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "arcveepn-rtt-ping");
-            t.setDaemon(true);
-            return t;
-        });
-        Future<Long> f = one.submit(() -> {
-            Socket sock = null;
-            try {
-                // Setup (untimed): DNS + TCP + TLS + CONNECT 200.
-                sock = Upstream.connectViaServer(s, "1.1.1.1", 80, null);
-                sock.setSoTimeout(3000);
-                java.io.InputStream in = sock.getInputStream();
-                java.io.OutputStream out = sock.getOutputStream();
-                String req = "GET / HTTP/1.0\r\n"
-                        + "Host: 1.1.1.1\r\n"
-                        + "Connection: close\r\n\r\n";
-                long t0 = System.currentTimeMillis();
-                out.write(req.getBytes(StandardCharsets.ISO_8859_1));
-                out.flush();
-                // First response byte = one round trip through
-                // the proxy. (The rest of the tiny response is
-                // never read — the socket is closed right away.)
-                int b = in.read();
-                if (b < 0) return -1L;
-                return System.currentTimeMillis() - t0;
-            } catch (Throwable e) {
-                return -1L;
-            } finally {
-                try { if (sock != null) sock.close(); } catch (Throwable ignored) {}
-            }
-        });
+    /** v5: through-tunnel RTT for the CONNECTED server — the
+     *  number Speedtest shows. A minimal HTTP GET to the
+     *  generate_204 endpoint (empty 204, no TLS inside the
+     *  tunnel) sent through the sing-box `mixed` inbound on
+     *  127.0.0.1:1080, which routes via the active outbound
+     *  (the connected server). The tunnel is already
+     *  established, so this is ~1 RTT through it — unlike
+     *  the pre-connect SsProbe, which also pays the SS
+     *  handshake + relay setup (~2-3 RTTs) and so reads
+     *  ~400 ms where Speedtest reads ~140 ms. Returns ms
+     *  to the response headers, or -1 on any failure.
+     *  Works in both modes: the mixed inbound listens on
+     *  1080 in VPN mode too (v4 fix) and in proxy mode. */
+    private long tunnelRttMs() {
+        HttpURLConnection c = null;
         try {
-            Long ms = f.get(RTT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            return ms == null ? -1 : ms;
-        } catch (Throwable e) {
-            try { f.cancel(true); } catch (Throwable ignored) {}
+            Proxy proxy = new Proxy(Proxy.Type.HTTP,
+                    new InetSocketAddress("127.0.0.1", SOCKS_PORT));
+            c = (HttpURLConnection) new URL("http://www.gstatic.com/generate_204")
+                    .openConnection(proxy);
+            c.setConnectTimeout(5000);
+            c.setReadTimeout(5000);
+            c.setRequestMethod("GET");
+            c.setUseCaches(false);
+            long t0 = System.currentTimeMillis();
+            int code = c.getResponseCode();
+            long ms = System.currentTimeMillis() - t0;
+            if (code == 204 || (code >= 200 && code < 300)) return ms;
+            return -1;
+        } catch (Throwable ignored) {
             return -1;
         } finally {
-            one.shutdownNow();
+            if (c != null) { try { c.disconnect(); } catch (Throwable ignored) {} }
         }
     }
 
-    /** RTT ping a list of servers in parallel, two probes each,
-     *  best wins. Only successes, sorted fastest (lowest ms)
-     *  first. sb14: `epoch` is the connect epoch that owns
-     *  this probe (EPOCH_NONE = never abort); a superseded
-     *  probe aborts FAST — the pool is shut down hard instead
-     *  of waiting out the 30 s awaitTermination. */
-    private List<PingResult> pingTestServers(List<Server> servers, long epoch) {
-        List<PingResult> out = new ArrayList<>();
-        if (servers == null || servers.isEmpty()) return out;
-        ExecutorService ex = Executors.newFixedThreadPool(Math.min(servers.size(), 20));
-        List<Future<Long>> futs = new ArrayList<>();
-        for (Server s : servers) {
-            final Server sv = s;
-            futs.add(ex.submit(() -> {
-                // Two independent RTT probes, best wins — a
-                // single sample can spike; the min is the stable
-                // latency, like Speedtest's best sample.
-                long a = rttPingMs(sv);
-                long b = rttPingMs(sv);
-                if (a < 0) return b;
-                if (b < 0) return a;
-                return Math.min(a, b);
-            }));
-        }
-        ex.shutdown();
-        // sb14: poll termination in short slices so a
-        // superseded connect aborts within ~500 ms instead of
-        // waiting out the full 30 s; the results are discarded.
-        // The 60-slice cap preserves the old 30 s ceiling.
-        int slices = 0;
-        try {
-            while (!ex.awaitTermination(500, TimeUnit.MILLISECONDS)) {
-                if (!epochAlive(epoch)) { ex.shutdownNow(); return new ArrayList<>(); }
-                if (++slices >= 60) { ex.shutdownNow(); break; }
-            }
-        } catch (InterruptedException e) {
-            ex.shutdownNow();
-            return new ArrayList<>();
-        } catch (Throwable ignored) {}
-        for (int i = 0; i < servers.size(); i++) {
-            try {
-                Future<Long> f = futs.get(i);
-                if (!f.isDone()) continue;
-                Long ms = f.get();
-                if (ms != null && ms >= 0) out.add(new PingResult(servers.get(i), servers.get(i).region, ms));
-            } catch (Throwable ignored) {}
-        }
-        out.sort((a, b) -> Long.compare(a.ms, b.ms));
-        return out;
+    /** Server (TEST): user-initiated connect to one Server
+     *  Shadowsocks server. Same epoch discipline as doConnect:
+     *  a newer attempt supersedes this one silently.
+     *  Server v2: picking a server by hand cancels Fastest
+     *  mode (bumping the fastest epoch stops any sweep from
+     *  switching afterwards). */
+    private void doConnect(String ip, String flag, String proto) {
+        fastestServer = false;
+        fastestServerEpoch++;
+        doConnectInternal(ip, flag, proto);
     }
 
-    /** RTT ping up to PING_MAX_PER_REGION servers of one
-     *  region. Empty = no server in this region carried traffic. */
-    private List<PingResult> pingRegion(VeePnApi api, String region, String excludeHost, long epoch) {
-        try {
-            List<Server> servers = getServersCached(api, region);
-            List<Server> cand = new ArrayList<>();
-            for (Server s : servers) {
-                if (excludeHost != null && excludeHost.equals(s.host())) continue;
-                cand.add(s);
-                if (cand.size() >= PING_MAX_PER_REGION) break;
-            }
-            if (!epochAlive(epoch)) return new ArrayList<>();
-            List<PingResult> res = pingTestServers(cand, epoch);
-            for (PingResult r : res) r.region = region;
-            return res;
-        } catch (Throwable e) {
-            return new ArrayList<>();
-        }
-    }
-
-    /** RTT ping every region (up to 2 servers each,
-     *  parallel). Only successes, fastest first. */
-    private List<PingResult> pingAllRegions(VeePnApi api, List<String> regions, long epoch) {
-        List<Server> cand = new ArrayList<>();
-        Map<Server, String> serverRegion = new ConcurrentHashMap<>();
-        for (String region : regions) {
-            try {
-                List<Server> servers = getServersCached(api, region);
-                int n = 0;
-                for (Server s : servers) {
-                    cand.add(s); serverRegion.put(s, region);
-                    if (++n >= PING_MAX_PER_REGION) break;
-                }
-            } catch (Throwable ignored) {}
-        }
-        if (!epochAlive(epoch)) return new ArrayList<>();
-        List<PingResult> res = pingTestServers(cand, epoch);
-        for (PingResult r : res) r.region = serverRegion.getOrDefault(r.server, r.server.region);
-        return res;
-    }
-
-    // ---------- emergency fallback only: TCP connect (v1.5 method) ----------
-
-    private long tcpProbeMs(Server s) {
-        try {
-            String host = s.host();
-            if (host.isEmpty()) return -1;
-            String ip = InetAddress.getByName(host).getHostAddress();
-            long start = System.currentTimeMillis();
-            Socket sock = new Socket();
-            try {
-                sock.connect(new InetSocketAddress(ip, s.port), TCP_TIMEOUT_MS);
-            } finally {
-                try { sock.close(); } catch (Throwable ignored) {}
-            }
-            return System.currentTimeMillis() - start;
-        } catch (Throwable e) {
-            return -1;
-        }
-    }
-
-    private List<Server> tcpRankedServers(List<Server> servers, long epoch) {
-        List<Server> out = new ArrayList<>();
-        if (servers == null || servers.isEmpty()) return out;
-        ExecutorService ex = Executors.newFixedThreadPool(Math.min(servers.size(), 20));
-        Map<Server, Long> probes = new ConcurrentHashMap<>();
-        List<Future<?>> futs = new ArrayList<>();
-        for (Server s : servers) {
-            final Server sv = s;
-            futs.add(ex.submit(() -> probes.put(sv, tcpProbeMs(sv))));
-        }
-        ex.shutdown();
-        // sb14: same fast-abort polling as pingTestServers
-        // (8 slices x 500 ms preserves the old 4 s ceiling).
-        int slices = 0;
-        try {
-            while (!ex.awaitTermination(500, TimeUnit.MILLISECONDS)) {
-                if (!epochAlive(epoch)) { ex.shutdownNow(); return new ArrayList<>(); }
-                if (++slices >= 8) { ex.shutdownNow(); break; }
-            }
-        } catch (InterruptedException e) {
-            ex.shutdownNow();
-            return new ArrayList<>();
-        } catch (Throwable ignored) {}
-        List<Server> cand = new ArrayList<>();
-        for (Server s : servers) {
-            Long ms = probes.get(s);
-            if (ms != null && ms >= 0) cand.add(s);
-        }
-        cand.sort((a, b) -> Long.compare(
-                probes.getOrDefault(a, Long.MAX_VALUE), probes.getOrDefault(b, Long.MAX_VALUE)));
-        return cand;
-    }
-
-    private void reportPings(List<PingResult> results, List<String> allRegions) {
-        try {
-            Map<String, Long> best = new HashMap<>();
-            for (PingResult r : results) {
-                Long cur = best.get(r.region);
-                if (cur == null || r.ms < cur) best.put(r.region, r.ms);
-            }
-            JSONArray arr = new JSONArray();
-            if (allRegions != null) {
-                for (String region : allRegions) {
-                    JSONObject o = new JSONObject();
-                    o.put("code", region);
-                    o.put("pingMs", best.containsKey(region) ? best.get(region) : -1);
-                    arr.put(o);
-                }
-            } else {
-                for (Map.Entry<String, Long> e : best.entrySet()) {
-                    JSONObject o = new JSONObject();
-                    o.put("code", e.getKey());
-                    o.put("pingMs", e.getValue());
-                    arr.put(o);
-                }
-            }
-            eval("window.onPings(" + jsString(arr.toString()) + ")");
-        } catch (Throwable ignored) {}
-    }
-
-    private List<ConnectCandidate> pingToCandidates(List<PingResult> results, String display, String fallbackRegion) {
-        List<ConnectCandidate> out = new ArrayList<>();
-        for (PingResult r : results) {
-            String disp = display;
-            if (display == null) {
-                String name = (r.server.regionName != null && !r.server.regionName.isEmpty())
-                        ? r.server.regionName : r.region;
-                disp = name + " (" + r.region + ")";
-            }
-            out.add(new ConnectCandidate(r.server, r.region, disp));
-        }
-        return out;
-    }
-
-    private List<ConnectCandidate> serversToCandidates(List<Server> servers, String display, String region) {
-        List<ConnectCandidate> out = new ArrayList<>();
-        for (Server s : servers) {
-            String disp = display;
-            if (display == null) {
-                String name = (s.regionName != null && !s.regionName.isEmpty()) ? s.regionName : region;
-                disp = name + " (" + (s.region != null && !s.region.isEmpty() ? s.region : region) + ")";
-            }
-            out.add(new ConnectCandidate(s, region, disp));
-        }
-        return out;
-    }
-
-    /** Try candidates in order until the tunnel actually reports
-     *  running. Returns true on the first working server. sb14:
-     *  a superseded attempt stops here — it must never start a
-     *  server for an attempt the user replaced. */
-    private boolean tryRankedConnect(List<ConnectCandidate> candidates, long epoch) {
-        int tries = 0;
-        for (ConnectCandidate c : candidates) {
-            if (!epochAlive(epoch)) return false;
-            if (tries++ >= 3) break;
-            try {
-                if (startServiceWithServer(c.server, c.display, c.region, candidates, epoch)) return true;
-                if (!epochAlive(epoch)) return false;
-                try {
-                    Intent d = new Intent(this, VpnTunnelService.class);
-                    d.setAction(VpnTunnelService.ACTION_DISCONNECT);
-                    startService(d);
-                    Thread.sleep(800);
-                } catch (Throwable ignored) {}
-            } catch (Throwable ignored) {}
-        }
-        return false;
-    }
-
-    /** Full fallback chain for one region, synchronous. Returns
-     *  true if a tunnel is up. Sets lastError on failure. sb14:
-     *  every phase boundary checks the epoch — a superseded
-     *  attempt returns false SILENTLY (it must NOT touch
-     *  connecting/lastError: the new attempt owns them, and
-     *  the doConnect wrapper only shows an error for the
-     *  current attempt). */
-    private boolean connectRegionSync(String region, String display, String excludeHost, long epoch) {
-        lastError = "";
-        connecting = true;
-        connectingSince = System.currentTimeMillis();
-        currentRegionCode = region;
-        currentDisplay = display;
-        fastestModeFlag = false;
-        if (excludeHost == null) optimizeCount = 0;
-        try {
-            VeePnApi api = new VeePnApi(this);
-            List<PingResult> ping = pingRegion(api, region, excludeHost, epoch);
-            if (!epochAlive(epoch)) return false;
-            if (!ping.isEmpty()) {
-                reportPings(ping, java.util.Collections.singletonList(region));
-                if (tryRankedConnect(pingToCandidates(ping, display, region), epoch)) return true;
-            }
-            if (!epochAlive(epoch)) return false;
-            // Emergency fallback: TCP ranking, then API order.
-            List<Server> servers = getServersCached(api, region);
-            List<Server> cand = new ArrayList<>();
-            for (Server s : servers) {
-                if (excludeHost != null && excludeHost.equals(s.host())) continue;
-                cand.add(s);
-            }
-            List<Server> tcp = tcpRankedServers(cand, epoch);
-            if (!epochAlive(epoch)) return false;
-            if (!tcp.isEmpty() && tryRankedConnect(serversToCandidates(tcp, display, region), epoch)) return true;
-            if (!epochAlive(epoch)) return false;
-            if (!cand.isEmpty() && tryRankedConnect(serversToCandidates(cand.subList(0, Math.min(3, cand.size())), display, region), epoch)) return true;
-            lastError = "Could not connect to servers in this region";
-            connecting = false;
-            return false;
-        } catch (Throwable e) {
-            // sb14: only report the failure if this attempt is
-            // still current — a superseded one stays silent.
-            // sb15 (no-logs audit): the generic message only —
-            // never e.getMessage() (raw exception text) in the
-            // user-visible status.
-            if (epoch == connectEpoch) {
-                connecting = false;
-                lastError = "Could not connect to servers in this region";
-            }
-            return false;
-        }
-    }
-
-    /** Full fallback chain for Fastest, synchronous. sb14:
-     *  same epoch checks as connectRegionSync. */
-    private boolean connectFastestSync(long epoch) {
-        lastError = "";
-        connecting = true;
-        connectingSince = System.currentTimeMillis();
-        optimizeCount = 0;
-        fastestModeFlag = true;
-        try {
-            VeePnApi api = new VeePnApi(this);
-            List<String> regions = new ArrayList<>();
-            try {
-                for (Location l : api.locations()) regions.add(l.region);
-            } catch (Throwable ignored) {}
-            if (regions.isEmpty()) {
-                String[] fb = {"fr-prs", "gb-lnd", "nl", "ru-spb", "sg", "us-or", "us-va"};
-                for (String r : fb) regions.add(r);
-            }
-            if (!epochAlive(epoch)) return false;
-            List<PingResult> ping = pingAllRegions(api, regions, epoch);
-            if (!epochAlive(epoch)) return false;
-            if (!ping.isEmpty()) {
-                reportPings(ping, regions);
-                if (tryRankedConnect(pingToCandidates(ping, null, null), epoch)) return true;
-            }
-            if (!epochAlive(epoch)) return false;
-            // Emergency fallback: TCP best per region, then API order.
-            List<ConnectCandidate> tcpCands = new ArrayList<>();
-            for (String region : regions) {
-                if (!epochAlive(epoch)) return false;
-                try {
-                    List<Server> servers = getServersCached(api, region);
-                    List<Server> tcp = tcpRankedServers(servers, epoch);
-                    if (!epochAlive(epoch)) return false;
-                    if (!tcp.isEmpty()) {
-                        Server s = tcp.get(0);
-                        String name = (s.regionName != null && !s.regionName.isEmpty()) ? s.regionName : region;
-                        tcpCands.add(new ConnectCandidate(s, region, name + " (" + region + ")"));
-                    }
-                } catch (Throwable ignored) {}
-            }
-            if (!tcpCands.isEmpty() && tryRankedConnect(tcpCands, epoch)) return true;
-            if (!epochAlive(epoch)) return false;
-            List<ConnectCandidate> apiCands = new ArrayList<>();
-            for (String region : regions) {
-                try {
-                    List<Server> servers = getServersCached(api, region);
-                    if (!servers.isEmpty()) {
-                        Server s = servers.get(0);
-                        String name = (s.regionName != null && !s.regionName.isEmpty()) ? s.regionName : region;
-                        apiCands.add(new ConnectCandidate(s, region, name + " (" + region + ")"));
-                    }
-                } catch (Throwable ignored) {}
-            }
-            if (!apiCands.isEmpty() && tryRankedConnect(apiCands, epoch)) return true;
-            lastError = "Could not connect to any server";
-            connecting = false;
-            return false;
-        } catch (Throwable e) {
-            // sb15 (no-logs audit): the generic message only —
-            // never e.getMessage() (raw exception text) in the
-            // user-visible status.
-            if (epoch == connectEpoch) {
-                connecting = false;
-                lastError = "Could not connect to any server";
-            }
-            return false;
-        }
-    }
-
-    private void doConnect(String region, String display, String excludeHost) {
-        doConnect(region, display, excludeHost, true);
-    }
-
-    /** sb14: every user-initiated connect gets a fresh epoch
-     *  (the flow aborts silently if a newer attempt supersedes
-     *  it). saveSelection = persist the pick as the last
-     *  server on success — false for optimize's
-     *  auto-reconnects, which must never overwrite the user's
-     *  choice. */
-    private void doConnect(String region, String display, String excludeHost, boolean saveSelection) {
+    /** Server v2: the shared connect entry for a single Server
+     *  server — used by the user path and by the Fastest
+     *  live-switch. On failure while Fastest is on, the next
+     *  best server is tried instead of erroring right away. */
+    private void doConnectInternal(String ip, String flag, String proto) {
         final long epoch = ++connectEpoch;
         new Thread(() -> {
-            boolean ok = connectRegionSync(region, display, excludeHost, epoch);
-            if (ok && saveSelection) {
-                try { AppSettings.setLastSelection(MainActivity.this, region); } catch (Throwable ignored) {}
-            }
-            // sb14: only the CURRENT attempt may report an
-            // error — a superseded one stays silent.
+            boolean ok = connectServerSync(ip, flag, proto, epoch);
             if (!ok && epoch == connectEpoch) {
-                eval("window.onConnectError(" + jsString(lastError) + ")");
+                if (fastestServer) {
+                    failedIps.add(ip);
+                    if (!maybeSwitchFastest(fastestServerEpoch)) {
+                        if (!VpnTunnelService.running && !connecting) {
+                            eval("window.onConnectError(" + jsString(lastError) + ")");
+                        }
+                    }
+                } else {
+                    eval("window.onConnectError(" + jsString(lastError) + ")");
+                }
             }
         }).start();
     }
 
+    /** Server v2: Fastest mode — start a ping sweep and switch
+     *  live to the best server as results arrive. No server is
+     *  picked up front; the sweep's first good result triggers
+     *  the first connect (see maybeSwitchFastest). */
     private void doConnectFastest() {
-        doConnectFastest(true);
+        fastestServer = true;
+        fastestServerEpoch++;
+        serverBestIp = null;
+        serverBestMs = Long.MAX_VALUE;
+        failedIps.clear();
+        try { AppSettings.setLastSelection(MainActivity.this, AppSettings.SEL_FASTEST); } catch (Throwable ignored) {}
+        // NOTE: `connecting` is deliberately NOT set here —
+        // maybeSwitchFastest refuses to switch while it is
+        // set, and the sweep must be free to start the first
+        // connect. The WebView stays on "Connecting…" from
+        // its own state + the serverTesting status flag (see
+        // poll); `connecting` is set by the switch itself.
+        startServerPingSweep();
+        // v7: if a background sweep is already running, the
+        // start above is a no-op (the guard) — try an
+        // immediate switch to the best server measured so
+        // far, so a Fastest tap mid-sweep still connects at
+        // once instead of waiting for the running sweep to
+        // end. No-op when nothing is measured yet (the
+        // running sweep's next result then switches, via
+        // the live fastestServer check in the sweep thread).
+        maybeSwitchFastest(fastestServerEpoch);
     }
 
-    private void doConnectFastest(boolean saveSelection) {
-        final long epoch = ++connectEpoch;
-        new Thread(() -> {
-            boolean ok = connectFastestSync(epoch);
-            if (ok && saveSelection) {
-                try { AppSettings.setLastSelection(MainActivity.this, AppSettings.SEL_FASTEST); } catch (Throwable ignored) {}
-            }
-            if (!ok && epoch == connectEpoch) {
-                eval("window.onConnectError(" + jsString(lastError) + ")");
-            }
-        }).start();
-    }
-
-    private boolean startServiceWithServer(Server server, String display, String regionCode,
-            List<ConnectCandidate> candidates, long epoch) throws Exception {
-        // sb14: never start for a superseded attempt.
-        if (!epochAlive(epoch)) return false;
-        currentRegionCode = regionCode;
-        currentDisplay = display;
-        VpnTunnelService.currentServer = server;
-        VpnTunnelService.currentRegion = display;
-        // sb9: hand the service the region code, the Fastest flag,
-        // and extra servers (ranked candidates + warm cache) so
-        // SingBoxConfig can build the per-region outbounds and
-        // the urltest group. No new network calls here: the cache
-        // is whatever the launch auto-test fetched (60 s TTL).
-        VpnTunnelService.connectRegionCode = regionCode == null ? "" : regionCode;
-        VpnTunnelService.fastestMode = fastestModeFlag;
-        // sb10: hand the service the connection mode and the
-        // split-tunneling settings for this connect.
-        VpnTunnelService.proxyMode = AppSettings.isProxyMode(this);
-        VpnTunnelService.splitMode = AppSettings.getSplitMode(this);
-        VpnTunnelService.splitPackages = AppSettings.getSplitPackages(this);
-        List<Server> extras = new ArrayList<>();
-        if (candidates != null) {
-            for (ConnectCandidate c : candidates) {
-                if (c != null && c.server != null) extras.add(c.server);
-            }
-        }
+    /** One TCP-connect probe to an Server VMess server
+     *  (ip:port): the time to establish the TCP connection,
+     *  or -1 when it does not answer within the timeout.
+     *  VMess-only — Shadowsocks servers use the real
+     *  handshake probe (SsProbe) instead, because a port
+     *  that answers TCP is not proof the SS service behind
+     *  it works. */
+    private long tcpProbeServer(String ip, int port) {
+        Socket sock = null;
         try {
-            for (Map.Entry<String, CachedServers> e : serverCache.entrySet()) {
-                if (e.getValue() != null && e.getValue().servers != null
-                        && !e.getValue().servers.isEmpty()) {
-                    extras.add(e.getValue().servers.get(0));
+            long t0 = System.currentTimeMillis();
+            sock = new Socket();
+            sock.connect(new InetSocketAddress(ip, port), PING_TIMEOUT_MS);
+            return System.currentTimeMillis() - t0;
+        } catch (Throwable ignored) {
+            return -1;
+        } finally {
+            try { if (sock != null) sock.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /** Server v2: ping sweep over the subscription servers
+     *  (20 parallel probes). Shadowsocks servers get a REAL
+     *  handshake probe (SsProbe — full AEAD handshake +
+     *  relay, so a dead SS service reads TIMEOUT instead of
+     *  a fake ~60 ms TCP connect); VMess servers keep the
+     *  TCP-connect probe. Every result is streamed to the
+     *  WebView as it arrives (onServerPing) so the list
+     *  lights up live; in Fastest mode each result is also a
+     *  chance to switch (maybeSwitchFastest). A sweep
+     *  already running is not started twice. At the end, a
+     *  Fastest sweep that connected to nothing and found no
+     *  usable server reports the error — a sweep that is
+     *  mid-connect, or that already connected, stays silent.
+     *  v7: the sweep checks the LIVE fastestServer state
+     *  (not a flag captured at start) — a Fastest tap while
+     *  a background sweep is already running must adopt
+     *  that sweep, so its results switch live instead of
+     *  the tap silently doing nothing. */
+    private synchronized void startServerPingSweep() {
+        if (pingThread != null && pingThread.isAlive()) return;
+        pingThread = new Thread(() -> {
+            try {
+                List<Server> list = serverCache;
+                if (list == null || list.isEmpty()) {
+                    try { list = new SubscriptionApi().fetchServers(); serverCache = list; }
+                    catch (Throwable ignored) { list = new ArrayList<>(); }
+                }
+                if (list.isEmpty()) {
+                    if (fastestServer
+                            && !VpnTunnelService.running && !connecting) {
+                        eval("window.onConnectError("
+                                + jsString("Could not load servers.") + ")");
+                    }
+                    return;
+                }
+                ExecutorService ex = Executors.newFixedThreadPool(Math.min(list.size(), 20));
+                for (Server a : list) {
+                    final Server sv = a;
+                    ex.submit(() -> {
+                        long ms;
+                        if ("vmess".equals(sv.proto)) {
+                            ms = tcpProbeServer(sv.ip, sv.port);
+                        } else {
+                            // Real SS handshake probe: validates
+                            // the whole path (handshake + relay).
+                            // -1 = TIMEOUT (dead server).
+                            ms = SsProbe.probe(sv.ip, sv.port, sv.method,
+                                    sv.password, PING_TIMEOUT_MS);
+                        }
+                        serverPingMs.put(sv.ip, ms);
+                        try {
+                            JSONObject o = new JSONObject();
+                            o.put("ip", sv.ip);
+                            // v11: send the port too, so the JS
+                            // keys the ping by ip:port (a unique
+                            // server identity).
+                            o.put("port", sv.port);
+                            o.put("pingMs", ms);
+                            eval("window.onServerPing(" + jsString(o.toString()) + ")");
+                        } catch (Throwable ignored) {}
+                        // v7: live fastestServer — a Fastest tap
+                        // mid-sweep adopts this running sweep.
+                        if (fastestServer) maybeSwitchFastest(fastestServerEpoch);
+                    });
+                }
+                ex.shutdown();
+                try {
+                    int slices = 0;
+                    while (!ex.awaitTermination(500, TimeUnit.MILLISECONDS)) {
+                        if (++slices >= 40) { ex.shutdownNow(); break; }
+                    }
+                } catch (InterruptedException e) {
+                    ex.shutdownNow();
+                }
+                if (fastestServer
+                        && !VpnTunnelService.running && !connecting
+                        && computeServerBest() == null) {
+                    eval("window.onConnectError(" + jsString("Could not connect to any server.") + ")");
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                eval("window.onServerPingDone()");
+            }
+        }, "arcveepn-server-ping");
+        pingThread.setDaemon(true);
+        pingThread.start();
+    }
+
+    /** Best (lowest-ms) Server server from the last ping sweep,
+     *  skipping failures and servers a Fastest connect already
+     *  tried and failed. Updates serverBestIp/serverBestMs.
+     *  Null = no usable server measured yet. */
+    private synchronized String computeServerBest() {
+        String bestIp = null;
+        long bestMs = Long.MAX_VALUE;
+        for (Map.Entry<String, Long> e : serverPingMs.entrySet()) {
+            if (e.getValue() == null || e.getValue() < 0) continue;
+            if (failedIps.contains(e.getKey())) continue;
+            if (e.getValue() < bestMs) { bestMs = e.getValue(); bestIp = e.getKey(); }
+        }
+        serverBestIp = bestIp;
+        serverBestMs = bestIp == null ? Long.MAX_VALUE : bestMs;
+        return bestIp;
+    }
+
+    /** Server v2 Fastest live-switch: while a Fastest sweep is
+     *  running, switch to the best server found SO FAR — as
+     *  results arrive, not only when the sweep ends. Only
+     *  switches when the new best is at least
+     *  FASTEST_MIN_GAIN_MS better than the server we
+     *  are on, so near-equal results never flap the tunnel.
+     *  `connecting` is set synchronously here, so two results
+     *  landing at once cannot start two connects. Returns
+     *  true when a connect was started. */
+    private synchronized boolean maybeSwitchFastest(long fEpoch) {
+        if (!fastestServer || fEpoch != fastestServerEpoch) return false;
+        if (connecting) return false;
+        String bestIp = computeServerBest();
+        if (bestIp == null) return false;
+        if (bestIp.equals(connectedServerIp)) return false;
+        if (connectedServerIp != null
+                && serverBestMs >= connectedServerMs - FASTEST_MIN_GAIN_MS) return false;
+        String flag = "";
+        String proto = "ss";
+        List<Server> list = serverCache;
+        if (list != null) {
+            for (Server a : list) {
+                if (a != null && bestIp.equals(a.ip)) {
+                    flag = a.flag == null ? "" : a.flag;
+                    proto = a.proto == null ? "ss" : a.proto;
+                    break;
                 }
             }
-        } catch (Throwable ignored) {}
-        VpnTunnelService.extraServers = extras;
-        // sb14: if a tunnel is already up, stop it first and wait
-        // for it to go down — startTunnel() is a no-op while
-        // running, so starting over it would silently keep the
-        // old server.
-        // v1.9-proxyfix: this used to apply only when the running
-        // server was DIFFERENT; the same-server case returned
-        // success without restarting ("Already up for this exact
-        // server — nothing to start"). A Connect on a stale
-        // running service — e.g. the proxy after another VPN
-        // (Nord) came and went, whose outbound/DNS state is dead
-        // — then never restarted sing-box, so the dead proxy
-        // stayed dead however often the user tapped Connect. A
-        // Connect now always restarts the service (stop + fresh
-        // start). No automatic path depends on the old no-op:
-        // optimize / reconnectAfterNetworkChange disconnect first,
-        // and the Fastest re-test only ever switches to a
-        // DIFFERENT server — so the only caller that reaches here
-        // with the service already up is a (re)connect to the
-        // same server, where a restart is exactly what is wanted.
-        if (VpnTunnelService.running) {
-            Intent d = new Intent(this, VpnTunnelService.class);
-            d.setAction(VpnTunnelService.ACTION_DISCONNECT);
-            startService(d);
-            for (int k = 0; k < 20; k++) {
-                Thread.sleep(100);
-                if (!epochAlive(epoch)) return false;
-                if (!VpnTunnelService.running) break;
-            }
-            if (VpnTunnelService.running) return false;
         }
-        Intent i = new Intent(this, VpnTunnelService.class);
-        i.setAction(VpnTunnelService.ACTION_CONNECT);
-        i.putExtra(VpnTunnelService.EXTRA_REGION, VpnTunnelService.currentRegion);
-        if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
-        else startService(i);
-        for (int k = 0; k < 10; k++) {
-            Thread.sleep(500);
-            if (!epochAlive(epoch)) return false;
-            if (VpnTunnelService.running) break;
-        }
-        if (!VpnTunnelService.running) return false;
-        // sb14: the tunnel that came up may belong to a
-        // superseded attempt (its start finished after this
-        // attempt began) — only claim success for THIS server
-        // and THIS epoch. runningServer is what startTunnel()
-        // actually built, not the intended currentServer.
-        if (!epochAlive(epoch)) return false;
-        if (VpnTunnelService.runningServer != server) return false;
-        watchdogStop = false;
-        startWatchdog();
-        startSbPingPoller();
-        // sb15: Fastest re-test only while on Fastest in VPN mode.
-        if (fastestModeFlag && !VpnTunnelService.proxyMode) startFastestRetest();
-        new Bridge().checkExitIp();
+        connecting = true;
+        connectingSince = System.currentTimeMillis();
+        doConnectInternal(bestIp, flag, proto);
         return true;
     }
 
+
+    /** v8: the cached SS list (empty when never fetched).
+     *  Re-parsed  exactly like a fresh fetch,
+     *  with the subscription bucket-roll refresh applied. */
+    private List<Server> loadSsCache() {
+        try {
+            return SubscriptionApi.parseCacheJson(AppSettings.getCachedSs(this));
+        } catch (Throwable ignored) {
+            return new ArrayList<>();
+        }
+    }
+
+    /** Server (TEST): single-server connect, synchronous. No
+     *  ping/ranking fallbacks (one server, one attempt) — the
+     *  server comes from the cached subscription list,
+     *  re-fetched fresh if the cache is empty. Returns true
+     *  only when the tunnel is actually running for THIS
+     *  server. Sets the Server statics AFTER the stop-and-wait:
+     *  stopTunnel() clears currentServer, so setting it
+     *  before the stop would leave startTunnel with nothing
+     *  to build. */
+    private boolean connectServerSync(String ip, String flag, String proto, long epoch) {
+        lastError = "";
+        connecting = true;
+        connectingSince = System.currentTimeMillis();
+        currentRegionCode = "server";
+        optimizeCount = 0;
+        try {
+            Server server = null;
+            List<Server> list = serverCache;
+            if (list != null) {
+                for (Server a : list) {
+                    if (a != null && ip.equals(a.ip)
+                            && (proto == null || proto.equals(a.proto))) { server = a; break; }
+                }
+            }
+            if (server == null) {
+                try {
+                    List<Server> fresh = new SubscriptionApi().fetchServers();
+                    serverCache = fresh;
+                    for (Server a : fresh) {
+                        if (a != null && ip.equals(a.ip)
+                                && (proto == null || proto.equals(a.proto))) { server = a; break; }
+                    }
+                } catch (Throwable ignored) {}
+            }
+            if (server == null) {
+                if (epoch == connectEpoch) {
+                    connecting = false;
+                    lastError = "Could not connect to this server.";
+                }
+                return false;
+            }
+            if (!epochAlive(epoch)) return false;
+            // Display for the notification / status: flag only
+            // (never a provider name — nothing user-visible may
+            // name the subscription source).
+            String display = (flag != null && !flag.isEmpty() ? flag : ip);
+            currentDisplay = display;
+            if (VpnTunnelService.running) {
+                Intent d = new Intent(this, VpnTunnelService.class);
+                d.setAction(VpnTunnelService.ACTION_DISCONNECT);
+                startService(d);
+                for (int k = 0; k < 20; k++) {
+                    Thread.sleep(100);
+                    if (!epochAlive(epoch)) return false;
+                    if (!VpnTunnelService.running) break;
+                }
+                if (VpnTunnelService.running) return false;
+            }
+            if (!epochAlive(epoch)) return false;
+            VpnTunnelService.currentServer = server;
+            VpnTunnelService.currentRegion = display;
+            VpnTunnelService.proxyMode = AppSettings.isProxyMode(this);
+            VpnTunnelService.splitMode = AppSettings.getSplitMode(this);
+            VpnTunnelService.splitPackages = AppSettings.getSplitPackages(this);
+            Intent i = new Intent(this, VpnTunnelService.class);
+            i.setAction(VpnTunnelService.ACTION_CONNECT);
+            i.putExtra(VpnTunnelService.EXTRA_REGION, display);
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+            else startService(i);
+            for (int k = 0; k < 10; k++) {
+                Thread.sleep(500);
+                if (!epochAlive(epoch)) return false;
+                if (VpnTunnelService.running) break;
+            }
+            if (!VpnTunnelService.running) {
+                if (epoch == connectEpoch) {
+                    connecting = false;
+                    lastError = "Could not connect to this server.";
+                }
+                return false;
+            }
+            if (!epochAlive(epoch)) return false;
+            if (VpnTunnelService.runningServer != server) {
+                if (epoch == connectEpoch) {
+                    connecting = false;
+                    lastError = "Could not connect to this server.";
+                }
+                return false;
+            }
+            watchdogStop = false;
+            startWatchdog();
+            // v5: record the connected server BEFORE starting
+            // the ping poller, so its first iteration already
+            // measures the through-tunnel RTT for this server
+            // (otherwise the first RTT would wait a full
+            // 30 s sleep, because connectedServerIp was null).
+            connectedServerIp = ip;
+            connectedServerMs = serverPingMs.getOrDefault(ip, Long.MAX_VALUE);
+            startSbPingPoller();
+            new Bridge().checkExitIp();
+            // Server v2: re-evaluate Fastest — a better server
+            // may have been measured while this connect was in
+            // flight, so switch to it now instead of waiting
+            // for the next sweep.
+            connecting = false;
+            if (fastestServer) maybeSwitchFastest(fastestServerEpoch);
+            return true;
+        } catch (Throwable e) {
+            if (epoch == connectEpoch) {
+                connecting = false;
+                lastError = "Could not connect to this server.";
+            }
+            return false;
+        }
+    }
+
     /** sb11: live ping of the connected server, re-measured
-     *  every 30 s while connected. The DISPLAYED ping is the
-     *  RTT ping (a request/response on an established CONNECT
+     *  while connected. The DISPLAYED ping is the RTT ping
+     *  (a request/response on an established CONNECT
      *  tunnel to the live server, over the direct path — the
      *  app is excluded from the TUN, so this works while
      *  connected, in both modes). The Clash API delay is NO
@@ -1385,161 +1282,71 @@ public class MainActivity extends Activity {
      *  HTTPS fetch — the same multi-RTT error as the old ping);
      *  Clash stays only for sing-box's internal urltest use. A
      *  failed probe leaves lastSbPingMs at -1 and the JS keeps
-     *  the previous displayed value. */
+     *  the previous displayed value.
+     *  v5: while an Server server is connected, the poller
+     *  measures the through-tunnel RTT (tunnelRttMs, best of
+     *  two) and publishes it as lastSbPingMs, so the JS shows
+     *  the Speedtest-like value instead of the pre-connect
+     *  SsProbe value (~400 ms while Speedtest showed ~140 ms).
+     *  A failed probe keeps the last good value (never -1
+     *  while the tunnel is up). Refreshes every 10 s. */
     private synchronized void startSbPingPoller() {
         if (sbPingThread != null && sbPingThread.isAlive()) return;
         lastSbPingMs = -1;
         sbPingThread = new Thread(() -> {
             while (!watchdogStop && VpnTunnelService.running) {
+                boolean ok = false;
                 try {
-                    long ms = -1;
-                    Server cur = VpnTunnelService.currentServer;
-                    if (cur != null) ms = rttPingMs(cur);
-                    if (ms < 0 && cur != null) ms = rttPingMs(cur);
-                    lastSbPingMs = ms;
+                    if (connectedServerIp != null) {
+                        long a = tunnelRttMs();
+                        long b = tunnelRttMs();
+                        long best = -1;
+                        if (a > 0 && b > 0) best = Math.min(a, b);
+                        else if (a > 0) best = a;
+                        else if (b > 0) best = b;
+                        if (best > 0) { lastSbPingMs = best; ok = true; }
+                    }
                 } catch (Throwable ignored) {
-                    lastSbPingMs = -1;
+                    // keep the last good value
                 }
-                try { Thread.sleep(30000); } catch (Throwable e) { break; }
+                // v6: if the RTT measurement just failed (tunnel
+                // still warming up), retry in 2 s instead of
+                // waiting the full 10 s — so the accurate
+                // through-tunnel ping appears quickly after
+                // connect instead of showing the pre-connect
+                // SsProbe value for a whole interval.
+                long sleepMs;
+                if (connectedServerIp != null) sleepMs = ok ? 10000 : 2000;
+                else sleepMs = 30000;
+                try {
+                    Thread.sleep(sleepMs);
+                } catch (Throwable e) { break; }
             }
         }, "arcveepn-sb-ping");
         sbPingThread.setDaemon(true);
         sbPingThread.start();
     }
-
-    /** sb15: Fastest periodic re-test + auto-switch. One round:
-     *  re-test ALL regions with the same RTT ping as the ranking
-     *  (2 probes per server, best wins), INCLUDING a fresh
-     *  measurement of the currently connected server in the same
-     *  round, then switch ONLY if a DIFFERENT server is clearly
-     *  better — at least FASTEST_SWITCH_MIN_GAIN_MS faster AND at
-     *  least 25% lower ping (both conditions, so noise never
-     *  flaps the server). The switch goes through the existing
-     *  disconnect + reconnect path (doConnectFastest(false)), so
-     *  the selection stays "fastest", last_selection is untouched,
-     *  and future re-tests keep working. If the current server is
-     *  still best, or the best is within the margin, stay — no
-     *  switch, no reconnect. Never more than one switch per
-     *  interval: a round runs, then the thread sleeps the full
-     *  interval. Runs on a background thread, in parallel like
-     *  the ranking, and never blocks the UI. Every result and
-     *  decision is logged to the silent ConnectLog only. */
-    private synchronized void startFastestRetest() {
-        if (fastestRetestThread != null && fastestRetestThread.isAlive()) return;
-        fastestRetestThread = new Thread(() -> {
-            while (!watchdogStop && VpnTunnelService.running
-                    && fastestModeFlag && !VpnTunnelService.proxyMode) {
-                try { Thread.sleep(FASTEST_RETEST_INTERVAL_MS); } catch (Throwable e) { break; }
-                if (watchdogStop || !VpnTunnelService.running) break;
-                if (!fastestModeFlag || VpnTunnelService.proxyMode) break;
-                if (connecting) continue; // user mid-connect — skip this round
-                try {
-                    retestFastestOnce();
-                } catch (Throwable ignored) {}
-            }
-        }, "arcveepn-fastest-retest");
-        fastestRetestThread.setDaemon(true);
-        fastestRetestThread.start();
-    }
-
-    private void retestFastestOnce() {
-        Server cur = VpnTunnelService.currentServer;
-        if (cur == null) return;
-        try {
-            VeePnApi api = new VeePnApi(this);
-            List<String> regions = new ArrayList<>();
-            try {
-                for (Location l : api.locations()) regions.add(l.region);
-            } catch (Throwable ignored) {}
-            if (regions.isEmpty()) {
-                String[] fb = {"fr-prs", "gb-lnd", "nl", "ru-spb", "sg", "us-or", "us-va"};
-                for (String r : fb) regions.add(r);
-            }
-            List<PingResult> ping = pingAllRegions(api, regions, EPOCH_NONE);
-            // Guards again after the (slow) round: the user may
-            // have disconnected, switched region, or started a
-            // connect while the round was running.
-            if (!VpnTunnelService.running || !fastestModeFlag
-                    || VpnTunnelService.proxyMode || connecting) return;
-            if (ping.isEmpty()) {
-                ConnectLog.log(this, "fastest retest: no server answered, staying");
-                return;
-            }
-            // Fresh measurement of the currently connected server
-            // in the same round (it may not be among the ranked
-            // candidates — the cache is re-fetched after 60 s, so
-            // the Server objects are new; compare by host+port).
-            long curMs = -1;
-            for (PingResult r : ping) {
-                if (sameServer(r.server, cur)) { curMs = r.ms; break; }
-            }
-            if (curMs < 0) {
-                List<PingResult> one = pingTestServers(
-                        java.util.Collections.singletonList(cur), EPOCH_NONE);
-                if (!one.isEmpty()) curMs = one.get(0).ms;
-            }
-            if (curMs < 0) {
-                ConnectLog.log(this, "fastest retest: current server unmeasurable, staying");
-                return;
-            }
-            PingResult best = ping.get(0); // sorted fastest first
-            ConnectLog.log(this, "fastest retest: best=" + best.server.host()
-                    + " " + best.ms + "ms current=" + cur.host() + " " + curMs + "ms");
-            if (sameServer(best.server, cur)) {
-                ConnectLog.log(this, "fastest retest: current still best, staying");
-                return;
-            }
-            boolean clearlyBetter = best.ms <= curMs - FASTEST_SWITCH_MIN_GAIN_MS
-                    && best.ms * 4 <= curMs * 3; // at least 25% lower
-            if (!clearlyBetter) {
-                ConnectLog.log(this, "fastest retest: best within margin, staying");
-                return;
-            }
-            ConnectLog.log(this, "fastest retest: switching to " + best.server.host()
-                    + " (" + best.ms + "ms vs " + curMs + "ms)");
-            // Switch via the existing path. doConnectFastest(false)
-            // does NOT touch last_selection (stays "fastest") and
-            // is not treated as a user-initiated connect.
-            doConnectFastest(false);
-        } catch (Throwable ignored) {}
-    }
-
-    /** Same upstream server (host + port). The ping cache is
-     *  re-fetched after 60 s, so the Server objects are new
-     *  instances — identity (==) cannot be used across rounds. */
-    private static boolean sameServer(Server a, Server b) {
-        if (a == null || b == null) return false;
-        String ha = a.host(), hb = b.host();
-        return ha != null && ha.equals(hb) && a.port == b.port;
-    }
-
-    /** sb15: re-establish the tunnel after a real underlying-
-     *  network change (debounced, both modes, connected only).
-     *  v1.9-proxyfix: proxy mode included — a change of the
-     *  underlying network, or of another VPN's presence (see
-     *  VpnTunnelService.vpnPresenceSuffix), re-establishes the
-     *  proxy the same way as the VPN. The old tunnel's sockets
-     *  are on the old network, so it must be re-established
-     *  either way — but the server only ever changes in Fastest
-     *  mode:
-     *  - Fastest: full fresh re-test of all regions + connect to
-     *    the overall best server (no margin needed — a reconnect
-     *    is required anyway; if the best is the same server it
-     *    still reconnects). last_selection stays "fastest".
-     *  - Fixed region: re-establish the SAME selected server —
-     *    no re-test, no ranking, no switch. The server never
-     *    changes without the user choosing it. last_selection
-     *    stays that region.
-     *  Runs on a background thread; the decision is logged to the
-     *  silent ConnectLog only. */
     private void reconnectAfterNetworkChange() {
         final long epoch = ++connectEpoch;
-        final boolean fastest = fastestModeFlag;
         final String region = currentRegionCode;
         final String display = currentDisplay;
-        final Server cur = VpnTunnelService.currentServer;
-        ConnectLog.log(this, "netchange reconnect fastest=" + fastest
-                + " region=" + region);
+        // Server v2: the same snapshot for an Server tunnel.
+        final boolean aFast = fastestServer;
+        final String aIp = connectedServerIp;
+        String aFl = "";
+        String aPr = "ss";
+        if (aIp != null && serverCache != null) {
+            for (Server a : serverCache) {
+                if (a != null && aIp.equals(a.ip)) {
+                    aFl = a.flag == null ? "" : a.flag;
+                    aPr = a.proto == null ? "ss" : a.proto;
+                    break;
+                }
+            }
+        }
+        final String aFlag = aFl;
+        final String aProto = aPr;
+        ConnectLog.log(this, "netchange reconnect region=" + region);
         new Thread(() -> {
             try {
                 // Stop the old tunnel (same disconnect + wait as
@@ -1558,37 +1365,18 @@ public class MainActivity extends Activity {
                             "netchange: old tunnel still up, abort");
                     return;
                 }
-                if (fastest) {
-                    // Full fresh re-test + best server. The (false)
-                    // means: do NOT touch last_selection.
-                    doConnectFastest(false);
-                    return;
-                }
-                if (cur == null || region == null) {
+                // Network change on an Server tunnel — Fastest
+                // re-tests from scratch, a fixed server
+                // re-establishes the SAME server.
+                if ("server".equals(region)) {
+                    if (aFast) { doConnectFastest(); return; }
+                    if (aIp != null) { doConnectInternal(aIp, aFlag, aProto); return; }
                     ConnectLog.log(MainActivity.this,
-                            "netchange: no current server, abort");
+                            "netchange: no server server, abort");
                     return;
                 }
-                connecting = true;
-                connectingSince = System.currentTimeMillis();
-                currentRegionCode = region;
-                currentDisplay = display;
-                fastestModeFlag = false;
-                lastError = "";
-                try {
-                    boolean ok = startServiceWithServer(cur, display, region, null, epoch);
-                    if (!ok && epoch == connectEpoch) {
-                        connecting = false;
-                        lastError = "Could not connect to servers in this region";
-                        eval("window.onConnectError(" + jsString(lastError) + ")");
-                    }
-                } catch (Throwable e) {
-                    if (epoch == connectEpoch) {
-                        connecting = false;
-                        lastError = "Could not connect to servers in this region";
-                        eval("window.onConnectError(" + jsString(lastError) + ")");
-                    }
-                }
+                ConnectLog.log(MainActivity.this,
+                        "netchange: no current server, abort");
             } catch (Throwable ignored) {}
         }, "arcveepn-netchange").start();
     }

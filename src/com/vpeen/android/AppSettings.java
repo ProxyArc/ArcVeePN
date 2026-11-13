@@ -8,9 +8,7 @@ import java.util.Set;
 
 /**
  * sb10: persisted user settings for the SB build, kept in a
- * dedicated SharedPreferences file ("arcveepn_sb") — separate
- * from the "vpeen" file VeePnApi uses for its token/servers, so
- * a settings change can never disturb the API state.
+ * dedicated SharedPreferences file ("arcveepn_sb").
  *
  * - mode: "vpn" (default — whole device through the TUN) or
  *   "proxy" (no TUN, no VPN permission, sing-box serves a local
@@ -36,8 +34,13 @@ public final class AppSettings {
     // Fastest; afterwards the app reopens on the last pick.
     public static final String KEY_LAST_SELECTION = "last_selection";
     public static final String SEL_FASTEST = "fastest";
-    private static final String[] KNOWN_REGIONS = {
-            "fr-prs", "gb-lnd", "nl", "ru-spb", "sg", "us-or", "us-va"};
+    // v8: the last successfully fetched server list, so the
+    // country dropdown is never empty when the internet is
+    // down on app open. SS is the raw subscription text
+    // (ss:// lines for the primary sub, or the base64 vmess
+    // blob for the backup) with the fetch time. Stored as a
+    // JSON string: {"fetchedAt":<ms>,"kind":"ss"|"vmess","text":"..."}.
+    public static final String KEY_CACHE_SS = "cache_ss";
 
     public static final String MODE_VPN = "vpn";
     public static final String MODE_PROXY = "proxy";
@@ -106,16 +109,33 @@ public final class AppSettings {
         }
     }
 
-    /** sb14: last server the user picked — "fastest" or a
-     *  region code. Unknown values fall back to Fastest. */
+    /** sb14: last server the user picked — "fastest" or
+     *  "server:<ip>". Unknown values fall back to Fastest. */
     public static String getLastSelection(Context ctx) {
         try {
             String s = prefs(ctx).getString(KEY_LAST_SELECTION, SEL_FASTEST);
             if (SEL_FASTEST.equals(s)) return SEL_FASTEST;
-            for (String r : KNOWN_REGIONS) if (r.equals(s)) return s;
+            if (s != null && s.startsWith("server:") && isServerSelection(s)) return s;
             return SEL_FASTEST;
         } catch (Throwable ignored) {
             return SEL_FASTEST;
+        }
+    }
+
+    /** Server v2: "server:<ip>" — an IPv4 literal, nothing else. */
+    private static boolean isServerSelection(String s) {
+        try {
+            String ip = s.substring("server:".length());
+            if (ip.isEmpty() || ip.length() > 15) return false;
+            int dots = 0;
+            for (int i = 0; i < ip.length(); i++) {
+                char c = ip.charAt(i);
+                if (c == '.') dots++;
+                else if (c < '0' || c > '9') return false;
+            }
+            return dots == 3;
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
@@ -124,9 +144,7 @@ public final class AppSettings {
             String v = SEL_FASTEST;
             if (code != null) {
                 if (SEL_FASTEST.equals(code)) v = SEL_FASTEST;
-                else for (String r : KNOWN_REGIONS) {
-                    if (r.equals(code)) { v = r; break; }
-                }
+                else if (code.startsWith("server:") && isServerSelection(code)) v = code;
             }
             prefs(ctx).edit().putString(KEY_LAST_SELECTION, v).apply();
         } catch (Throwable ignored) {}
@@ -148,4 +166,27 @@ public final class AppSettings {
                     .apply();
         } catch (Throwable ignored) {}
     }
+
+
+    /** v8: persist the last successfully fetched SS
+     *  subscription (raw text + fetch time + kind) so the
+     *  country list survives a bad connection on the next
+     *  open. The raw text is stored, NOT the stored
+     *  password: on load it is re-parsed  exactly
+     *  like a fresh fetch. */
+    public static void saveCachedSs(Context ctx, String cacheJson) {
+        try {
+            prefs(ctx).edit().putString(KEY_CACHE_SS, cacheJson == null ? "" : cacheJson).apply();
+        } catch (Throwable ignored) {}
+    }
+
+    public static String getCachedSs(Context ctx) {
+        try {
+            String s = prefs(ctx).getString(KEY_CACHE_SS, "");
+            return s == null ? "" : s;
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
 }

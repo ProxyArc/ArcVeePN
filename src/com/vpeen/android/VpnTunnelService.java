@@ -28,14 +28,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * EXPERIMENTAL sing-box build (ArcVeePN SB) — v1.8-sb2.
- * Same chain as stable v1.7 except the TUN core: app traffic ->
- * TUN (Android VpnService, fd handed to sing-box via
- * PlatformInterface.openTun) -> sing-box `http` outbound
- * (TLS + Basic auth to the VeePN proxy, SNI = VeePN host).
- * The Java LocalSocksServer (127.0.0.1:1080/8080) is KEPT: it is
- * what MainActivity uses for the exit-IP check and the tiny-GET
- * tunnel test, and it dials the upstream directly with protect().
+ * sing-box build (ArcVeePN SB).
+ * Chain: app traffic -> TUN (Android VpnService, fd handed to
+ * sing-box via PlatformInterface.openTun) -> sing-box
+ * `shadowsocks` outbound (or `vmess` for backup-subscription
+ * servers). In proxy mode there is no TUN: sing-box serves a
+ * local SOCKS5/HTTP proxy on 127.0.0.1:1080/8080 instead, which
+ * MainActivity also uses for the exit-IP check.
  *
  * LAUNCH-CRASH FIX (sb1 -> sb2): this class references NO libbox
  * type at all — no imports, no fields, no method signatures.
@@ -55,16 +54,10 @@ public class VpnTunnelService extends VpnService {
     public static final String ACTION_DISCONNECT = "com.vpeen.android.DISCONNECT";
     public static final String EXTRA_REGION = "region";
 
-    public static volatile Server currentServer;
     public static volatile String currentRegion = "";
-    // sb14: the server the RUNNING tunnel was actually built
-    // for. MainActivity uses this — not currentServer, which
-    // is the *intended* server and is overwritten by the next
-    // attempt before the service reads it — to verify which
-    // tunnel came up when two connects race. Set inside
-    // startTunnel() from its local server, cleared in
-    // stopTunnel().
-    public static volatile Server runningServer = null;
+    // The Shadowsocks server this tunnel is for.
+    public static volatile Server currentServer;
+    public static volatile Server runningServer;
     public static volatile boolean running = false;
     public static volatile String status = "Disconnected";
     public static volatile long connectedAtMs = 0;
@@ -87,13 +80,6 @@ public class VpnTunnelService extends VpnService {
     public static volatile boolean statsEverNonZero = false;
     public static volatile long lastStatsAtMs = 0;
 
-    // sb9: set by MainActivity before Connect — the region code,
-    // whether this is a Fastest connect, and extra servers (ranked
-    // candidates + warm cache) for the per-region outbounds and
-    // the urltest group in SingBoxConfig.
-    public static volatile String connectRegionCode = "";
-    public static volatile boolean fastestMode = false;
-    public static volatile java.util.List<Server> extraServers = null;
 
     // sb10: set by MainActivity before Connect — connection mode
     // (VPN with TUN, or proxy with local SOCKS5/HTTP inbounds and
@@ -146,7 +132,6 @@ public class VpnTunnelService extends VpnService {
 
     private static final String TAG = "ArcVeePN";
 
-    private LocalSocksServer localProxy;
     // The sing-box runner: interface only, loaded reflectively on
     // Connect. Must stay an interface reference — never a
     // SingBoxRunner field, or the class would link libbox at load.
@@ -213,92 +198,61 @@ public class VpnTunnelService extends VpnService {
 
     private synchronized void startTunnel() throws Throwable {
         if (running) return;
+        // Shadowsocks path — single server, one attempt.
+        // The password is a rotating secret the subscription
+        // endpoint supplies; it is never computed here and
+        // never logged (the full config is NOT logged on this
+        // path — it contains the password).
         Server server = currentServer;
-        if (server == null) throw new Exception("No server selected");
-        // sb14: record which server this tunnel is actually
-        // built for, BEFORE running=true (running is set at
-        // the end of this method, so runningServer is always
-        // correct by the time running is true).
-        runningServer = server;
-        status = "Connecting…";
-        // DIAG (sb3d): every step is logged to connect.log so a
-        // hung Connect shows exactly where it stopped. Hostnames
-        // only — never username/password.
-        ConnectLog.log(this, "startTunnel begin region=" + currentRegion
-                + " server=" + server.host() + ":" + server.port);
-        // 1. Resolve upstream hostname BEFORE the TUN exists.
-        for (String addr : server.addresses) {
+        if (server != null) {
+            runningServer = server;
+            status = "Connecting…";
+            ConnectLog.log(this, "startTunnel begin server server=" + server.ip
+                    + ":" + server.port + " flag="
+                    + (server.flag == null ? "" : server.flag));
+            boolean proxy = proxyMode;
+            // No hostname pre-resolve (the server is an IP
+            // literal) and no LocalSocksServer: Shadowsocks
+            // needs no HTTP-proxy bridge. In proxy mode
+            // sing-box owns 127.0.0.1:1080/8080; in VPN mode
+            // the TUN feeds sing-box directly.
+            ConnectLog.log(this, "server: no local bridge, mode="
+                    + (proxy ? "proxy" : "vpn"));
+            startForeground(1, buildNotification());
+            ConnectLog.log(this, "foreground OK mode=" + (proxy ? "proxy" : "vpn"));
+            // Backup sub servers are VMess — same shape, a
+            // vmess outbound instead of shadowsocks.
+            String config = "vmess".equals(server.proto)
+                    ? SingBoxConfig.buildVmess(server, getPackageName(), proxy)
+                    : SingBoxConfig.buildServer(server, getPackageName(), proxy);
+            ConnectLog.log(this, "config built len=" + config.length());
+            ConnectLog.log(this, "config inbounds proxy=" + proxy
+                    + " mixed=" + config.contains("\"mixed-in\"")
+                    + " http=" + config.contains("\"http-in\"")
+                    + " tun=" + config.contains("\"tun-in\"")
+                    + " splitMode=" + splitMode
+                    + " splitPkgs=" + (splitPackages == null ? 0 : splitPackages.size()));
+            TunnelRunner r = loadRunner();
+            runner = r;
+            ConnectLog.log(this, "runner loaded OK");
             try {
-                InetAddress ip = InetAddress.getByName(addr);
-                server.resolvedIp = ip.getHostAddress();
-                break;
-            } catch (Throwable ignored) {}
+                ConnectLog.log(this, "runner.start begin");
+                r.start(config);
+                ConnectLog.log(this, "runner.start OK");
+            } catch (Throwable t) {
+                runner = null;
+                throw t;
+            }
+            running = true;
+            connectedAtMs = System.currentTimeMillis();
+            String fl = (server.flag != null && !server.flag.isEmpty())
+                    ? server.flag : server.ip;
+            status = "Connected to " + fl;
+            ConnectLog.log(this, "running=true");
+            Log.i(TAG, "sing-box tunnel up (server), server=" + server);
+            try { registerNetCallback(); } catch (Throwable ignored) {}
+            return;
         }
-        if (server.resolvedIp == null) {
-            Log.w(TAG, "could not pre-resolve upstream, sing-box will resolve via local-dns");
-            ConnectLog.log(this, "resolve FAILED, will let sing-box resolve");
-        } else {
-            ConnectLog.log(this, "resolve OK ip=" + server.resolvedIp);
-        }
-        // 2. Local SOCKS5/HTTP bridge (kept from v1.7: exit-IP check
-        // and tunnel test in MainActivity use it). VPN MODE ONLY:
-        // in proxy mode sing-box itself serves 127.0.0.1:1080
-        // (mixed) and 127.0.0.1:8080 (http) — starting the Java
-        // bridge too would be a second listener on the same ports
-        // (bind failure). The exit-IP check still works in proxy
-        // mode: it talks SOCKS5 to 127.0.0.1:1080, which is then
-        // sing-box's mixed inbound.
-        boolean proxy = proxyMode;
-        if (!proxy) {
-            Upstream.Protector protector = s -> {
-                try { protect(s); } catch (Throwable ignored) {}
-            };
-            localProxy = new LocalSocksServer(server, protector);
-            localProxy.start();
-            ConnectLog.log(this, "localProxy started");
-        } else {
-            ConnectLog.log(this, "proxy mode: LocalSocksServer skipped, sing-box owns 1080/8080");
-        }
-        // 3. Foreground notification (required for a long-running service).
-        startForeground(1, buildNotification());
-        ConnectLog.log(this, "foreground OK mode=" + (proxy ? "proxy" : "vpn"));
-        // 4. sing-box config + lazy core load (Connect only).
-        String config = SingBoxConfig.build(server, getPackageName(),
-                connectRegionCode, fastestMode, extraServers, proxy);
-        Log.i(TAG, "sing-box config:\n" + config);
-        ConnectLog.log(this, "config built len=" + config.length());
-        // DIAG (v1.9-fix): prove WHICH config was built — a proxy
-        // test's log must show mixed+http inbounds and no TUN,
-        // a VPN test's log must show the TUN. String checks only,
-        // no behaviour change.
-        ConnectLog.log(this, "config inbounds proxy=" + proxy
-                + " mixed=" + config.contains("\"mixed-in\"")
-                + " http=" + config.contains("\"http-in\"")
-                + " tun=" + config.contains("\"tun-in\"")
-                + " splitMode=" + splitMode
-                + " splitPkgs=" + (splitPackages == null ? 0 : splitPackages.size()));
-        TunnelRunner r = loadRunner();
-        runner = r;
-        ConnectLog.log(this, "runner loaded OK");
-        try {
-            ConnectLog.log(this, "runner.start begin");
-            r.start(config);
-            ConnectLog.log(this, "runner.start OK");
-        } catch (Throwable t) {
-            runner = null;
-            throw t;
-        }
-        // 5. Up.
-        running = true;
-        connectedAtMs = System.currentTimeMillis();
-        status = "Connected to " + currentRegion;
-        ConnectLog.log(this, "running=true");
-        Log.i(TAG, "sing-box tunnel up, region=" + currentRegion + " server=" + server);
-        // sb15: watch the underlying network from now on (both
-        // modes — v1.9-proxyfix: proxy mode included, so another
-        // VPN coming/going re-establishes the proxy too) — a
-        // change re-establishes the tunnel.
-        try { registerNetCallback(); } catch (Throwable ignored) {}
     }
 
     // ---------- sb15: underlying-network-change detection ----------
@@ -564,13 +518,12 @@ public class VpnTunnelService extends VpnService {
         try { unregisterNetCallback(); } catch (Throwable ignored) {}
         running = false;
         runningServer = null;
+        currentServer = null;
         connectedAtMs = 0;
         status = "Disconnected";
         resetTraffic();
         try { if (runner != null) runner.stop(); } catch (Throwable ignored) {}
         runner = null;
-        try { if (localProxy != null) localProxy.stop(); } catch (Throwable ignored) {}
-        localProxy = null;
         try { stopForeground(true); } catch (Throwable ignored) {}
     }
 

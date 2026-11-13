@@ -1,46 +1,20 @@
 # ArcVeePN
 
-ArcVeePN یک برنامه اندرویدی برای اتصال VPN است. با یک لمس وصل می‌شوید و همه ترافیک گوشی از تونل امن عبور می‌کند.
+Android VPN app — Shadowsocks (primary) with a VMess backup subscription,
+a WebView UI, proxy mode and VPN mode with split tunneling, and a real
+per-server ping test.
 
-آخرین نسخه: **v1.9**
+## Public source
 
-## ArcVeePN چه چیزی دارد
+This is the public version of the ArcVeePN 2.5 source. It is published
+for learning and reference. **Put your own subscription URLs in
+`SubscriptionApi.java`** (`SUBSCRIPTION_URL` and
+`BACKUP_SUBSCRIPTION_URL`) — the placeholders here point at
+`example.com` and return nothing, so a fork alone does not work
+like the official build.
 
-- اتصال VPN برای همه ترافیک گوشی، با سرویس VPN اندروید
-- سرورهای رایگان:
-  - 🇫🇷 فرانسه — پاریس
-  - 🇬🇧 بریتانیا — لندن
-  - 🇳🇱 هلند — آمستردام
-  - 🇷🇺 روسیه — سن‌پترزبورگ
-  - 🇸🇬 سنگاپور — سنگاپور
-  - 🇺🇸 آمریکا — اورگن
-  - 🇺🇸 آمریکا — ویرجینیا
-- ⚡ Fastest — Auto به‌صورت پیش‌فرض: تست واقعی از داخل تونل و اتصال به سریع‌ترین سروری که واقعاً کار می‌کند؛ هر چند دقیقه سرورها دوباره تست می‌شوند و اگر سرور بهتری پیدا شود، خودکار عوض می‌شود
-- نمایش پینگ هر سرور در لیست، به‌صورت خودکار موقع باز شدن برنامه
-- انتخاب دستی سرور از لیست، و تغییر سرور موقع اتصال
-- نمایش IP خروجی و منطقه متصل‌شده بعد از اتصال
-- اتصال مجدد خودکار هنگام تغییر شبکه (Wi-Fi / Mobile Data)
-- ذخیره آخرین سرور انتخاب‌شده
-- حالت Proxy — استفاده از پروکسی بدون فعال‌سازی VPN
-- Split Tunneling — انتخاب برنامه‌هایی که از VPN استفاده می‌کنند
-- منوی کناری برای دسترسی به تنظیمات
-- دکمه عضویت @ProxyArc در تلگرام
-- تغییر تم تاریک و روشن
-- آیکون ArcVeePN با گوشه‌های گرد، در همه اندازه‌ها
-- پایداری خودکار اتصال: اگر تونل گیر کند، برنامه خودش به سرور سالم دیگری وصل می‌شود
-- ادامه اتصال در پس‌زمینه، حتی وقتی از برنامه خارج می‌شوید
-- هر گوشی شناسه و توکن مهمان مخصوص خودش را می‌گیرد، و یوزر و پسورد هر اتصال تازه است
-- رابط برنامه با فونت‌های داخل برنامه، بدون نیاز به اینترنت برای نمایش طرح
+## Build
 
-## مشخصات
-
-- اندروید ۷٫۰ به بالا
-- پردازنده‌های arm64-v8a
-- حجم برنامه حدود ۱۶ مگابایت
-
-## سورس پروژه
-
-این ریپو سورس کامل برنامه است. برای ساخت نسخه خودتان، از کی‌استور خودتان استفاده کنید؛ کی‌استور و فایل APK در این ریپو نیست.
-
-📣 کانال: @ProxyArc
-💬 گپ: @proxy_Arc
+See `build.sh`. You need the Android SDK (build-tools 34) and JDK 17.
+Signing needs your own keystore — the official keystore is not
+published.
