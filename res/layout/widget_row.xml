@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 3.1 fix4: one row of the large widget's server list.
+     Flag + name on the left, ping on the right. The row
+     root (widget_row_root) is the tap target: a fill-in
+     intent (host + proto) connects directly to that
+     server. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_row_root"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:paddingTop="7dp"
+    android:paddingBottom="7dp"
+    android:paddingStart="4dp"
+    android:paddingEnd="4dp">
+    <TextView
+        android:id="@+id/widget_row_text"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:textColor="#ffffff"
+        android:textSize="13sp"
+        android:ellipsize="end"
+        android:maxLines="1" />
+    <TextView
+        android:id="@+id/widget_row_ping"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:textColor="#9aa7bd"
+        android:textSize="12sp" />
+</LinearLayout>

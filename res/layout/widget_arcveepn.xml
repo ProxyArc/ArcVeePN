@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 3.1 fix4: the LARGE widget layout (shown when the
+     widget is resized big). Header (widget_root) is the
+     tap target: connect directly to the last server, or
+     disconnect when already connected. Below it, a
+     "Ping test" button re-ranks the scrollable server
+     list by ping; a row tap connects directly to that
+     server. Only status + server name + list are shown —
+     no logs. RemoteViews supports a small view set; the
+     layout uses plain LinearLayouts, TextViews, one
+     ImageView and a ListView. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@drawable/widget_bg"
+    android:padding="12dp">
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+        <ImageView
+            android:id="@+id/widget_icon"
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:src="@drawable/ic_stat_arc"
+            android:contentDescription="ArcVeePN" />
+        <TextView
+            android:id="@+id/widget_title"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="ArcVeePN"
+            android:textColor="#ffffff"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+    <TextView
+        android:id="@+id/widget_status"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="Disconnected"
+        android:textColor="#9aa7bd"
+        android:textSize="13sp" />
+    <TextView
+        android:id="@+id/widget_server"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="Fastest — Auto"
+        android:textColor="#ffffff"
+        android:textSize="13sp"
+        android:ellipsize="end"
+        android:maxLines="1" />
+    <!-- 3.1 fix5: the "Ping test" button — full-width, solid
+         blue, refresh icon + bold white text, unmistakable
+         (fix4's small grey pill was easy to miss). The whole
+         row is the tap target (id widget_ping_btn). -->
+    <LinearLayout
+        android:id="@+id/widget_ping_btn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:background="@drawable/widget_ping_btn_bg"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:paddingTop="10dp"
+        android:paddingBottom="10dp">
+        <ImageView
+            android:layout_width="18dp"
+            android:layout_height="18dp"
+            android:src="@drawable/ic_refresh" />
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="Ping test"
+            android:textColor="#ffffff"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+    <ListView
+        android:id="@+id/widget_server_list"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="4dp"
+        android:divider="@null"
+        android:scrollbars="vertical" />
+    <TextView
+        android:id="@+id/widget_empty"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="No servers yet"
+        android:textColor="#9aa7bd"
+        android:textSize="12sp"
+        android:visibility="gone" />
+</LinearLayout>

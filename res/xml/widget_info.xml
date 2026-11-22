@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 3.1 fix4: home-screen widget. The DEFAULT size is ONE
+     app-icon cell (1x1, targetCell 1x1, min 40dp) — the
+     user asked for the widget to occupy the space of one
+     app. It is resizable (horizontal|vertical) down to
+     40dp and up to 360dp. No periodic updates
+     (updatePeriodMillis=0) — the app pushes updates on
+     connect/disconnect. initialLayout is the small
+     (flag) layout; the large (list) layout is chosen at
+     runtime when the widget is resized big. -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="40dp"
+    android:minHeight="40dp"
+    android:targetCellWidth="1"
+    android:targetCellHeight="1"
+    android:minResizeWidth="40dp"
+    android:minResizeHeight="40dp"
+    android:maxResizeWidth="360dp"
+    android:maxResizeHeight="360dp"
+    android:updatePeriodMillis="0"
+    android:initialLayout="@layout/widget_arcveepn_small"
+    android:resizeMode="horizontal|vertical"
+    android:widgetCategory="home_screen" />

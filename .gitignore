@@ -1,5 +1,9 @@
-build/
 *.apk
 *.keystore
-*.jks
-.DS_Store
+*.idsig
+*.log
+build/
+out/
+BUILD-NOTE-*.md
+*-backup.apk
+logo-source-*.jpg

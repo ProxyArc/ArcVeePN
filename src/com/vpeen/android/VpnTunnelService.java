@@ -58,6 +58,12 @@ public class VpnTunnelService extends VpnService {
     // The Shadowsocks server this tunnel is for.
     public static volatile Server currentServer;
     public static volatile Server runningServer;
+    // 3.1: the Firefox ProxyPass JWT for the tunnel being
+    // built, in memory only. MainActivity sets it (fresh,
+    // from FirefoxAuth.ensureProxyPass) right before
+    // ACTION_CONNECT when the server is a Firefox one, and
+    // null otherwise. Never logged, never persisted.
+    public static volatile String firefoxProxyPass;
     public static volatile boolean running = false;
     public static volatile String status = "Disconnected";
     public static volatile long connectedAtMs = 0;
@@ -80,7 +86,28 @@ public class VpnTunnelService extends VpnService {
     public static volatile boolean statsEverNonZero = false;
     public static volatile long lastStatsAtMs = 0;
 
+    // 3.1 fix: the renewal loop sets this when a token
+    // refresh fails terminally (dead login / spent quota).
+    // MainActivity's 1 s poll consumes it (see
+    // pollNetworkChange) and runs the existing generic
+    // auth-lost path — never a retry storm, never a token
+    // detail on screen.
+    private static volatile boolean firefoxAuthLostPending = false;
 
+    public static boolean consumeFirefoxAuthLostIfDue() {
+        try {
+            if (!firefoxAuthLostPending) return false;
+            firefoxAuthLostPending = false;
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    // 3.1 fix: the ProxyPass renewal loop (Arman model, see
+    // FirefoxAuth PROXY_PASS_RENEW_LEAD_MS). Runs only while
+    // a Firefox tunnel is up. Started in startTunnel, stopped
+    // in stopTunnel.
     // sb10: set by MainActivity before Connect — connection mode
     // (VPN with TUN, or proxy with local SOCKS5/HTTP inbounds and
     // no TUN at all) and the split-tunneling settings (VPN mode
@@ -199,32 +226,36 @@ public class VpnTunnelService extends VpnService {
     private synchronized void startTunnel() throws Throwable {
         if (running) return;
         // Shadowsocks path — single server, one attempt.
-        // The password is a rotating secret the subscription
-        // endpoint supplies; it is never computed here and
-        // never logged (the full config is NOT logged on this
-        // path — it contains the password).
-        Server server = currentServer;
-        if (server != null) {
-            runningServer = server;
+        // The password comes from the subscription link; it
+        // is never logged (the full config is NOT logged on
+        // this path — it contains the password).
+        Server sub = currentServer;
+        if (sub != null) {
+            runningServer = sub;
             status = "Connecting…";
-            ConnectLog.log(this, "startTunnel begin server server=" + server.ip
-                    + ":" + server.port + " flag="
-                    + (server.flag == null ? "" : server.flag));
+            ConnectLog.log(this, "startTunnel begin sub server=" + sub.ip
+                    + ":" + sub.port + " flag="
+                    + (sub.flag == null ? "" : sub.flag));
             boolean proxy = proxyMode;
             // No hostname pre-resolve (the server is an IP
             // literal) and no LocalSocksServer: Shadowsocks
             // needs no HTTP-proxy bridge. In proxy mode
             // sing-box owns 127.0.0.1:1080/8080; in VPN mode
             // the TUN feeds sing-box directly.
-            ConnectLog.log(this, "server: no local bridge, mode="
+            ConnectLog.log(this, "sub: no local bridge, mode="
                     + (proxy ? "proxy" : "vpn"));
             startForeground(1, buildNotification());
             ConnectLog.log(this, "foreground OK mode=" + (proxy ? "proxy" : "vpn"));
-            // Backup sub servers are VMess — same shape, a
-            // vmess outbound instead of shadowsocks.
-            String config = "vmess".equals(server.proto)
-                    ? SingBoxConfig.buildVmess(server, getPackageName(), proxy)
-                    : SingBoxConfig.buildServer(server, getPackageName(), proxy);
+            // 2.7 fix: multi-protocol — the config builder
+            // dispatches on the server's proto (ss / vmess /
+            // vless / trojan), so emergency-subscription
+            // servers of any protocol connect.
+            // 3.1: a Firefox server's config also carries the
+            // in-memory ProxyPass JWT (firefoxProxyPass, set
+            // by MainActivity just before this start); any
+            // other protocol ignores it.
+            String config = SingBoxConfig.build(sub, getPackageName(), proxy,
+                    firefoxProxyPass);
             ConnectLog.log(this, "config built len=" + config.length());
             ConnectLog.log(this, "config inbounds proxy=" + proxy
                     + " mixed=" + config.contains("\"mixed-in\"")
@@ -245,14 +276,193 @@ public class VpnTunnelService extends VpnService {
             }
             running = true;
             connectedAtMs = System.currentTimeMillis();
-            String fl = (server.flag != null && !server.flag.isEmpty())
-                    ? server.flag : server.ip;
+            String fl = (sub.flag != null && !sub.flag.isEmpty())
+                    ? sub.flag : sub.ip;
             status = "Connected to " + fl;
             ConnectLog.log(this, "running=true");
-            Log.i(TAG, "sing-box tunnel up (server), server=" + server);
+            Log.i(TAG, "sing-box tunnel up (sub), server=" + sub);
             try { registerNetCallback(); } catch (Throwable ignored) {}
+            // 3.1 fix: a Firefox tunnel's ProxyPass JWT expires
+            // 10 min after it was minted — start the renewal
+            // loop so the live session gets a fresh token.
+            try { startFirefoxRenewalLoop(); } catch (Throwable ignored) {}
+            // 3.1 fix3: push the connected state to the
+            // home-screen widget and the Quick Settings tile.
+            try { ArcVeePNWidget.updateAll(this); } catch (Throwable ignored) {}
+            try { ArcVeePNTileService.requestTileUpdate(this); } catch (Throwable ignored) {}
             return;
         }
+    }
+
+    /** Reload the live tunnel with a new config (renewal
+     *  path only). False when there is no runner to reload
+     *  (tunnel already down) — the caller must not treat
+     *  that as a renewal failure. */
+    public synchronized boolean reloadTunnelConfig(String config) {
+        try {
+            if (runner == null) return false;
+            runner.reload(config);
+            return true;
+        } catch (Throwable t) {
+            try { ConnectLog.log(this, "reloadTunnelConfig FAILED: "
+                    + t.getClass().getSimpleName()); } catch (Throwable ignored) {}
+            return false;
+        }
+    }
+
+    private volatile Thread ffxRenewThread = null;
+    private volatile boolean ffxRenewStop = false;
+    // 3.1 fix3: wall-clock time of the last successful live
+    // reload. The renewal loop must not reload more often
+    // than MIN_RELOAD_INTERVAL_MS (see shouldReloadForRenewal
+    // in FirefoxAuth) — each reload is a full tunnel teardown.
+    private volatile long ffxLastReloadAtMs = 0;
+
+    /** 3.1 fix — the Arman renewal model, adapted to this
+     *  app (Arman core/internal/proxy/renewal.go
+     *  RunRenewalLoop + adoptPass):
+     *  - Proactive: every RENEW_CHECK_INTERVAL_MS (30 s)
+     *    the WALL clock is read (never one long sleep — a
+     *    sleeping phone's timers stall while the pass
+     *    expires by wall clock, Arman's wallCheckInterval
+     *    is 15 s). When now passes the stored pass expiry
+     *    minus the 2-minute lead, a fresh pass is minted
+     *    (forceRefreshProxyPass — the plain ensure would
+     *    return the still-valid stored token) and the live
+     *    service is reloaded with the rebuilt config, the
+     *    session retained (Arman: updateCurrentSessionToken
+     *    -> "session=retained"; here: startOrReloadService
+     *    on the live CommandServer — the TUN is
+     *    re-established, the VpnService stays up, see
+     *    SingBoxRunner.reload).
+     *  - Reactive backstop (Firefox only): when real traffic
+     *    has flowed (statsEverNonZero, the sb9 guard) and
+     *    then NOTHING flows for STALL_WINDOW_MS (90 s) while
+     *    the stored pass has already EXPIRED, the same
+     *    refresh+reload runs. The expiry gate matters: an
+     *    idle user with a fresh pass must NOT trigger a
+     *    reload — no-flow alone is idle, not a stall.
+     *  - Retry: a transient refresh failure retries after
+     *    RENEW_RETRY_DELAY_MS (30 s, the loop's own sleep).
+     *    A terminal failure (reauth=true: dead login, spent
+     *    quota) stops the loop at once and flags
+     *    firefoxAuthLostPending — MainActivity surfaces the
+     *    existing generic auth-lost path, nothing more.
+     *  - 3.1 fix3 — no-gain guard: a reload happens ONLY
+     *    when the freshly fetched pass actually buys lifetime
+     *    (FirefoxAuth.shouldReloadForRenewal: new expiry
+     *    later than the old one, not already dead, and at
+     *    least MIN_RELOAD_INTERVAL_MS since the last reload).
+     *    The fix build reloaded whenever the pass was due,
+     *    without checking the fetch result — when Guardian
+     *    returns the same cached token, the expiry never
+     *    advances and the loop reloaded every 30 s forever,
+     *    each reload a full tunnel teardown (the ~10-minute
+     *    speed drop). A skipped reload keeps the tunnel and
+     *    its flows alive; the fetch is retried 30 s later.
+     *    The stored expiry is also clock-anchored at fetch
+     *    time (FirefoxAuth.anchorOffsetSeconds), so a skewed
+     *    phone clock cannot misjudge when the pass is due.
+     *  - Firefox-gated throughout: non-Firefox tunnels never
+     *    start this loop, and the sb9 watchdog guard
+     *    (statsEverNonZero) is untouched. */
+    private void startFirefoxRenewalLoop() {
+        try {
+            Server s = runningServer;
+            if (s == null || !"firefox".equals(s.proto)) return;
+            if (ffxRenewThread != null && ffxRenewThread.isAlive()) return;
+            ffxRenewStop = false;
+            // 3.1 fix3: a new tunnel has no reload yet — the
+            // min-interval guard starts from zero.
+            ffxLastReloadAtMs = 0;
+            ffxRenewThread = new Thread(() -> {
+                long lastFlowTotal = -1;
+                long lastFlowAtMs = System.currentTimeMillis();
+                while (!ffxRenewStop && running) {
+                    try { Thread.sleep(FirefoxAuth.RENEW_CHECK_INTERVAL_MS); }
+                    catch (InterruptedException e) { break; }
+                    if (ffxRenewStop || !running) break;
+                    try {
+                        Server cur = runningServer;
+                        if (cur == null || !"firefox".equals(cur.proto)) break;
+                        long now = System.currentTimeMillis();
+                        long[] st = tunnelStats();
+                        long total = (st.length > 3 ? st[1] + st[3] : 0);
+                        if (lastFlowTotal < 0) { lastFlowTotal = total; lastFlowAtMs = now; }
+                        else if (total != lastFlowTotal) { lastFlowTotal = total; lastFlowAtMs = now; }
+                        long passExp = FirefoxAuth.getProxyPassExpiresAtMs(this);
+                        boolean due = FirefoxAuth.shouldRenew(now, passExp,
+                                FirefoxAuth.PROXY_PASS_RENEW_LEAD_MS);
+                        boolean stalled = statsEverNonZero
+                                && now - lastFlowAtMs > FirefoxAuth.STALL_WINDOW_MS
+                                && passExp > 0 && now > passExp;
+                        if (!due && !stalled) continue;
+                        ConnectLog.log(this, "ffx renew: "
+                                + (stalled ? "stall+expired" : "expiry-2min"));
+                        String tok;
+                        try {
+                            tok = FirefoxAuth.forceRefreshProxyPass(this);
+                        } catch (FirefoxAuth.FfxException e) {
+                            if (e.reauth) {
+                                ConnectLog.log(this, "ffx renew: login dead, auth lost");
+                                firefoxAuthLostPending = true;
+                                break;
+                            }
+                            ConnectLog.log(this, "ffx renew: transient failure, retry in 30s");
+                            continue;
+                        } catch (Throwable t) {
+                            ConnectLog.log(this, "ffx renew: transient failure, retry in 30s");
+                            continue;
+                        }
+                        if (tok == null || tok.isEmpty()) continue;
+                        // 3.1 fix3: reload ONLY when the fresh
+                        // pass actually buys lifetime (see
+                        // FirefoxAuth.shouldReloadForRenewal).
+                        // The fix-build loop reloaded whenever
+                        // the pass was due, without checking what
+                        // the fetch returned — when Guardian
+                        // answers with the SAME cached token, the
+                        // stored expiry never advances, the pass
+                        // stays due, and the loop reloaded every
+                        // 30 s forever; each reload is a full
+                        // tunnel teardown, which is exactly the
+                        // "speed drops after ~10 min" symptom.
+                        // Skipping the reload keeps the tunnel
+                        // (and its flows) alive; the loop retries
+                        // the fetch 30 s later.
+                        long newExp = FirefoxAuth.getProxyPassExpiresAtMs(this);
+                        if (!FirefoxAuth.shouldReloadForRenewal(now, passExp,
+                                newExp, ffxLastReloadAtMs)) {
+                            ConnectLog.log(this, "ffx renew: no gain, skip reload");
+                            continue;
+                        }
+                        firefoxProxyPass = tok;
+                        Server srv = runningServer;
+                        if (srv == null) break;
+                        String cfg = SingBoxConfig.build(srv, getPackageName(), proxyMode, tok);
+                        if (!reloadTunnelConfig(cfg)) break;
+                        ffxLastReloadAtMs = System.currentTimeMillis();
+                        // Fresh token in place: the stall clock
+                        // restarts from here, so a slow recovery
+                        // cannot re-trigger immediately.
+                        lastFlowAtMs = System.currentTimeMillis();
+                        lastFlowTotal = total;
+                        ConnectLog.log(this, "ffx renew: reloaded with fresh pass");
+                    } catch (Throwable ignored) {}
+                }
+            }, "vpeen-ffx-renew");
+            ffxRenewThread.setDaemon(true);
+            ffxRenewThread.start();
+        } catch (Throwable ignored) {}
+    }
+
+    private void stopFirefoxRenewalLoop() {
+        try {
+            ffxRenewStop = true;
+            Thread t = ffxRenewThread;
+            ffxRenewThread = null;
+            if (t != null) t.interrupt();
+        } catch (Throwable ignored) {}
     }
 
     // ---------- sb15: underlying-network-change detection ----------
@@ -513,6 +723,12 @@ public class VpnTunnelService extends VpnService {
         // runner.stop lines, so the log shows whether a previous
         // tunnel was fully torn down before the next connect.
         try { ConnectLog.log(this, "stopTunnel begin running=" + running); } catch (Throwable ignored) {}
+        // 3.1 fix: stop the Firefox renewal loop first — it
+        // must never refresh a token for a dead tunnel — and
+        // drop the in-memory ProxyPass with the tunnel.
+        try { stopFirefoxRenewalLoop(); } catch (Throwable ignored) {}
+        firefoxProxyPass = null;
+        firefoxAuthLostPending = false;
         // sb15: stop watching the network first — no event may
         // fire while the tunnel is being torn down.
         try { unregisterNetCallback(); } catch (Throwable ignored) {}
@@ -525,6 +741,10 @@ public class VpnTunnelService extends VpnService {
         try { if (runner != null) runner.stop(); } catch (Throwable ignored) {}
         runner = null;
         try { stopForeground(true); } catch (Throwable ignored) {}
+        // 3.1 fix3: push the disconnected state to the
+        // home-screen widget and the Quick Settings tile.
+        try { ArcVeePNWidget.updateAll(this); } catch (Throwable ignored) {}
+        try { ArcVeePNTileService.requestTileUpdate(this); } catch (Throwable ignored) {}
     }
 
     @Override

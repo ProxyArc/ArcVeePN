@@ -16,6 +16,11 @@ public interface TunnelRunner {
     /** Start the tunnel with the given sing-box config JSON. */
     void start(String configJson) throws Throwable;
 
+    /** Reload the LIVE service with a new config, without a
+     *  full stop/start (3.1 fix: the Firefox ProxyPass
+     *  renewal path). Throws when there is no live service. */
+    void reload(String configJson) throws Throwable;
+
     /** Stop the tunnel and release all native resources. */
     void stop();
 }

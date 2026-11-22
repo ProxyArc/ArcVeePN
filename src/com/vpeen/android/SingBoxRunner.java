@@ -118,6 +118,46 @@ public class SingBoxRunner implements TunnelRunner {
         ConnectLog.log(service, "stats client started");
     }
 
+    /** 3.1 fix: reload the LIVE service with a new config
+     *  WITHOUT a full stop/start. This is the renewal path:
+     *  a fresh ProxyPass JWT goes into a rebuilt config and
+     *  the running sing-box picks it up. What it does to the
+     *  TUN, honestly: libbox startOrReloadService restarts
+     *  the sing-box service in place — the TUN inbound is
+     *  torn down and re-created, so SingBoxPlatform.openTun
+     *  runs again and Android hands the service a NEW TUN
+     *  fd (a brief traffic pause, established flows drop).
+     *  The VpnService itself is NOT stopped and the
+     *  foreground service does NOT die, so from Android's
+     *  (and the user's) perspective the VPN stays up — the
+     *  key icon never leaves. That brief re-establish is
+     *  acceptable versus a tunnel that is dead from the
+     *  10-minute pass expiry onwards. Traffic counters are
+     *  deliberately NOT reset here (unlike start): the
+     *  totals are cumulative since connect, and resetting
+     *  would clear statsEverNonZero and break the sb9
+     *  watchdog guard. The stats CommandClient stays
+     *  connected to the same CommandServer; if its stream
+     *  drops across the reload its loop reconnects. */
+    public synchronized void reload(String config) throws Throwable {
+        if (commandServer == null) throw new Exception("no running service to reload");
+        ConnectLog.log(service, "reload begin");
+        try {
+            Libbox.checkConfig(config);
+        } catch (Throwable t) {
+            ConnectLog.log(service, "reload checkConfig FAILED: " + t.getMessage());
+            throw new Exception("sing-box config rejected: " + t.getMessage(), t);
+        }
+        try {
+            commandServer.startOrReloadService(config, new OverrideOptions());
+        } catch (Throwable t) {
+            ConnectLog.log(service, "reload startOrReloadService FAILED: "
+                    + t.getClass().getSimpleName() + ": " + t.getMessage());
+            throw t;
+        }
+        ConnectLog.log(service, "reload OK");
+    }
+
     // sb9: the stats thread used to loop on
     // VpnTunnelService.running — but it is spawned HERE, before
     // startTunnel() sets running=true, so if the OS scheduled it

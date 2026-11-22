@@ -393,7 +393,7 @@ function paintPingsNow(){
 function startPingTest(){
   testing=true;
   renderList();
-  try{ AndroidBridge.pingServers(); }catch(e){}
+  try{ AndroidBridge.pingSub(); }catch(e){}
 }
 window.onServers=function(jsonStr){
   try{
@@ -411,13 +411,13 @@ window.onServersError=function(msg){
     if(st) st.textContent=msg||'Could not load servers.';
   }
 };
-window.onServerPing=function(jsonStr){
+window.onSubPing=function(jsonStr){
   try{
     var e=JSON.parse(jsonStr);
     if(e&&e.ip!=null) applyPing(e.ip,e.pingMs,e.port);
   }catch(err){}
 };
-window.onServerPingDone=function(){
+window.onSubPingDone=function(){
   testing=false;
   var rb=$('refreshBtn'); if(rb) rb.classList.remove('spin');
   flushPings(); /* paint any pings still queued, before the re-sort */
@@ -502,7 +502,7 @@ function chooseServer(s){
   var changed=!st.sel||st.sel.ip!==s.ip||(st.sel.proto||'ss')!==(s.proto||'ss');
   st.sel=s; st.fastestSel=false; renderList(); paintTrigger(); toggleList(false);
   if(!changed){ if(state==='idle') connect(); return; }
-  try{ AndroidBridge.saveLastSelection('server:'+s.ip); }catch(e){}
+  try{ AndroidBridge.saveLastSelection('sub:'+s.ip); }catch(e){}
   if(state==='on'){ pendingServer=s; pendingReconnect=true; disconnect(); return; }
   if(state==='busy'){
     try{ AndroidBridge.cancelConnect(); }catch(e){}
@@ -598,7 +598,7 @@ function connect(){
     setProg(p);
   },120);
   try{
-    if(cur().fastestSel||!cur().sel){ AndroidBridge.connectFastest(); }
+    if(cur().fastestSel||!cur().sel){ AndroidBridge.connectSubFastest(); }
     else { AndroidBridge.connectServer(cur().sel.ip, cur().sel.flag, cur().sel.proto||'ss'); }
   }catch(e){ connectInFlight=false; setState('idle'); }
 }
@@ -622,12 +622,12 @@ function poll(){
   try{
     if(typeof AndroidBridge==='undefined') return;
     var s=JSON.parse(AndroidBridge.getStatusJson());
-    var newIp=s.serverIp||null;
+    var newIp=s.subIp||null;
     if(newIp!==connectedIp){
       connectedIp=newIp;
       clearLiveRtt();
     }
-    if(s.serverTesting&&!testing){ testing=true; renderList(); }
+    if(s.subTesting&&!testing){ testing=true; renderList(); }
     if(s.mode&&s.mode!==curMode){ curMode=s.mode; paintMode(); paintConn(); }
     if(connectInFlight&&Date.now()-connectInFlightAt>30000) connectInFlight=false;
     if(s.connected){
@@ -723,8 +723,8 @@ function loadSettings(){
       settingsFirstLoad=false;
       selMode=curMode;
       var ls=s.lastSelection||'fastest';
-      if(ls&&ls!=='fastest'&&ls.indexOf('server:')===0){
-        pendingSelIp=ls.substring('server:'.length);
+      if(ls&&ls!=='fastest'&&ls.indexOf('sub:')===0){
+        pendingSelIp=ls.substring('sub:'.length);
       }
     }
   }catch(e){}
@@ -918,7 +918,7 @@ on('connectBtn','click',function(){
 on('refreshBtn','click',function(){
   var rb=$('refreshBtn');
   rb.classList.add('spin');
-  try{ AndroidBridge.refreshServersForce(); }catch(e){ rb.classList.remove('spin'); }
+  try{ AndroidBridge.refreshSubForce(); }catch(e){ rb.classList.remove('spin'); }
 });
 on('dropdownBtn','click',function(){toggleList();});
 on('countryList','click',function(e){
@@ -1024,7 +1024,7 @@ document.addEventListener('keydown',function(e){
     /* Safety: the app must never stay hidden if the animation stalls. */
     setTimeout(finishSplash,3500);
   })();
-  try{ AndroidBridge.refreshServersForce(); }catch(e){}
+  try{ AndroidBridge.refreshSubForce(); }catch(e){}
   try{ AndroidBridge.checkExitIp(); }catch(e){}
   setTimeout(poll,500);
 })();

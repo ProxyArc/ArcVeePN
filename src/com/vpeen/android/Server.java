@@ -2,13 +2,13 @@ package com.vpeen.android;
 
 /**
  * One server from a subscription (primary Shadowsocks or
- * backup VMess). The password / uuid is supplied by the
- * subscription and never logged anywhere (see SubscriptionApi).
+ * backup VMess). The password / uuid comes from the
+ * subscription link and is never logged anywhere.
  *
- * proto: "ss" (primary, Shadowsocks) or "vmess" (backup).
- * name: display name — for VMess the link's ps (may carry a
- * flag emoji); for SS it is empty and the UI derives the
- * country name from the flag.
+ * proto: "ss" (primary, Shadowsocks), "vmess", "vless" or
+ * "trojan" (backup). name: display name — for VMess the
+ * link's ps (may carry a flag emoji); for SS it is empty
+ * and the UI derives the country name from the flag.
  */
 public class Server {
     public String ip;
@@ -29,6 +29,10 @@ public class Server {
     public String path;      // ws path
     public String tls;       // "tls" | "none"
     public String serverName; // TLS SNI (host if set, else ip)
+
+    // VLESS / Trojan (emergency sub, multi-protocol).
+    public String flow;       // VLESS flow, e.g. "xtls-rprx-vision" (TLS only)
+    public String encryption; // VLESS encryption param, usually "none"
 
     /** IP + proto + flag only — NEVER the password/uuid. Safe for logs. */
     @Override public String toString() {

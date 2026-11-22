@@ -44,7 +44,7 @@ import javax.crypto.spec.SecretKeySpec;
  * - no byte within the timeout (or connect failure, or a
  *   non-AEAD method) -> TIMEOUT (-1).
  *
- * The password here is the REAL  secret -- the
+ * The password here is the link's password -- the
  * caller passes Server.password. It is never logged.
  */
 public final class SsProbe {
@@ -208,7 +208,7 @@ public final class SsProbe {
     }
 
     /** ChaCha20-Poly1305 (RFC 8439) encrypt; output is
-     *  password + 16-byte tag. */
+     *  ciphertext + 16-byte tag. */
     private static byte[] aeadEncrypt(byte[] key, byte[] nonce, byte[] plain)
             throws Exception {
         Cipher cipher = Cipher.getInstance("ChaCha20-Poly1305");

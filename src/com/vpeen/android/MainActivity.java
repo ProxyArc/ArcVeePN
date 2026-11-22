@@ -55,14 +55,14 @@ import java.util.concurrent.*;
  *    server, open the real upstream path (TLS to the proxy +
  *    HTTP CONNECT + per-session auth, exactly as real traffic
  *    goes) and fetch a tiny page over HTTP through it
- *    (example.com, 577 bytes, verified live). The time from
+ *    (a tiny public test page, 577 bytes, verified live). The time from
  *    before CONNECT to after the full tiny response is the
  *    real, end-to-end ping. Only servers that complete it count,
  *    and the lowest time wins. This is not a TCP port probe:
  *    a port can answer TCP yet fail CONNECT/auth, and that
  *    server is correctly excluded here.
- * 2. If example.com fails for ALL servers, retry the same test
- *    with neverssl.com (also verified live, HTTP only, no
+ * 2. If the test page fails for ALL servers, retry the same test
+ *    with a second test page (also verified live, HTTP only, no
  *    redirect), so one test-host outage cannot kill the app.
  * 3. If both tunnel tests fail, fall back to TCP connect ranking
  *    (v1.5 method, used ONLY as an emergency fallback, never
@@ -86,6 +86,15 @@ public class MainActivity extends Activity {
     private static final int REQ_VPN = 1001;
     private static final int REQ_NOTIF = 1002;
 
+    /** 3.1 fix3: the widget / Quick Settings tile tap opens
+     *  MainActivity with this extra (and this action) and the
+     *  Activity toggles the connection itself. The Activity
+     *  is singleTop, so a tap while the app is already open
+     *  delivers the intent to onNewIntent instead of stacking
+     *  a second Activity. */
+    public static final String EXTRA_AUTO_TOGGLE = "com.vpeen.android.AUTO_TOGGLE";
+    public static final String ACTION_WIDGET_TOGGLE = "com.vpeen.android.WIDGET_TOGGLE";
+
     // sb11 RTT ping (replaces the sb10 CONNECT-time ping): sb10
     // timed connection SETUP (DNS + TCP + TLS handshake + CONNECT
     // = 3-4 RTTs, and carrier DNS inside the timed window for
@@ -101,37 +110,37 @@ public class MainActivity extends Activity {
     // internal urltest use.
 
     private WebView webView;
-    // Server (TEST): pending connect while the VPN permission
-    // dialog is up, and the last fetched Server server list
+    // Sub (TEST): pending connect while the VPN permission
+    // dialog is up, and the last fetched Sub server list
     // (passwords stay in these objects only — never sent to
     // the WebView; the 30-min fetch cache lives in SubscriptionApi).
-    private String pendingIp;
-    private String pendingFlag;
-    private String pendingProto;
-    private volatile List<Server> serverCache;
-    // Server v2: per-server TCP ping results + Fastest
-    // live-switch. serverPingMs holds the last sweep's result
+    private String pendingSubIp;
+    private String pendingSubFlag;
+    private String pendingSubProto;
+    private volatile List<Server> subCache;
+    // Sub v2: per-server TCP ping results + Fastest
+    // live-switch. subPingMs holds the last sweep's result
     // per IP (ms, or -1 when the server did not answer);
-    // failedIps are servers a Fastest connect already
+    // subFailedIps are servers a Fastest connect already
     // tried and failed, so the next-best is tried instead.
-    private static final int PING_TIMEOUT_MS = 3000;
+    private static final int SUB_PING_TIMEOUT_MS = 3000;
     // Local proxy ports (were the removed Java bridge's
     // SOCKS_PORT / HTTP_PORT — sing-box serves these ports
     // itself in both modes now).
     private static final int SOCKS_PORT = 1080;
     private static final int HTTP_PORT = 8080;
-    private static final long FASTEST_MIN_GAIN_MS = 20;
-    private final Map<String, Long> serverPingMs = new ConcurrentHashMap<>();
-    private final java.util.Set<String> failedIps =
+    private static final long SUB_FASTEST_MIN_GAIN_MS = 20;
+    private final Map<String, Long> subPingMs = new ConcurrentHashMap<>();
+    private final java.util.Set<String> subFailedIps =
             java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
-    private volatile Thread pingThread = null;
-    private volatile boolean fastestServer = false;
-    private volatile long fastestServerEpoch = 0;
-    private volatile String serverBestIp = null;
-    private volatile long serverBestMs = Long.MAX_VALUE;
-    private volatile String connectedServerIp = null;
-    private volatile long connectedServerMs = Long.MAX_VALUE;
-    private volatile boolean pendingFastest = false;
+    private volatile Thread subPingThread = null;
+    private volatile boolean subFastest = false;
+    private volatile long subFastestEpoch = 0;
+    private volatile String subBestIp = null;
+    private volatile long subBestMs = Long.MAX_VALUE;
+    private volatile String subConnectedIp = null;
+    private volatile long subConnectedMs = Long.MAX_VALUE;
+    private volatile boolean pendingSubFastest = false;
     // v8: cached-list state. ssCacheLoaded is true when the
     // SS list on screen came from the offline cache (the
     // fresh fetch is still running or failed); the same
@@ -188,6 +197,25 @@ public class MainActivity extends Activity {
         // previous run to the external files dir (Files app can
         // open it) — NO on-screen display of any kind.
         try { CrashLog.mirrorToExternal(this); } catch (Throwable ignored) {}
+        // 2.7 fix: restore the emergency toggle — every fetch
+        // (including the refresh on open) must follow it.
+        try { SubscriptionApi.setEmergencyMode(AppSettings.isEmergencyMode(this)); }
+        catch (Throwable ignored) {}
+        // 3.1: Firefox mode takes priority over the emergency
+        // toggle — the two can never both be on. If the saved
+        // settings somehow have both, Firefox wins and the
+        // emergency toggle is turned off.
+        try {
+            if (AppSettings.isFirefoxMode(this) && AppSettings.isEmergencyMode(this)) {
+                AppSettings.setEmergencyMode(this, false);
+                SubscriptionApi.setEmergencyMode(false);
+            }
+        } catch (Throwable ignored) {}
+        // 2.7 fix2: restore the learned IP->country map before
+        // any fetch runs, so flag-less backup servers get their
+        // country from the first list shown.
+        try { SubscriptionApi.loadIpCc(AppSettings.getIpCc(this)); }
+        catch (Throwable ignored) {}
         if (Build.VERSION.SDK_INT >= 33) {
             if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
                     != PackageManager.PERMISSION_GRANTED) {
@@ -235,6 +263,72 @@ public class MainActivity extends Activity {
         webView.addJavascriptInterface(new Bridge(), "AndroidBridge");
         setContentView(webView);
         webView.loadUrl("file:///android_asset/index.html");
+        // 3.1 fix3: a widget / tile tap opens the app to toggle
+        // the connection (see handleAutoToggleIntent). The
+        // connect itself runs in Java and does not need the
+        // page to be loaded — the UI catches up through its
+        // 1 s poll once the page is up.
+        handleAutoToggleIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleAutoToggleIntent(intent);
+    }
+
+    /** 3.1 fix3: handle a widget / Quick Settings tile tap.
+     *  The decision (WidgetConnect) is: disconnect when a
+     *  tunnel is up; otherwise connect to the last server
+     *  (or Fastest); open the Firefox login dialog when the
+     *  last server is a Firefox server and the user is
+     *  logged out. Every path reuses the existing Bridge
+     *  connect/disconnect/login code — including the VPN
+     *  permission flow — so the tap behaves exactly like
+     *  the same tap inside the app. A failure shows the
+     *  same short generic message as an in-app failure, via
+     *  the normal status path; nothing extra is shown. */
+    private void handleAutoToggleIntent(Intent intent) {
+        try {
+            if (intent == null || !intent.getBooleanExtra(EXTRA_AUTO_TOGGLE, false)) return;
+            WidgetConnect.Decision d = WidgetConnect.decide(
+                    VpnTunnelService.running,
+                    AppSettings.isFirefoxMode(this),
+                    FirefoxAuth.isLoggedIn(this),
+                    AppSettings.getLastSelection(this));
+            Bridge b = new Bridge();
+            switch (d.action) {
+                case WidgetConnect.ACTION_DISCONNECT:
+                    b.disconnect();
+                    break;
+                case WidgetConnect.ACTION_OPEN_LOGIN:
+                    b.openFirefoxLogin("login");
+                    break;
+                case WidgetConnect.ACTION_CONNECT_SERVER: {
+                    String host = WidgetConnect.hostOf(d.server);
+                    // Resolve the protocol from the cached list
+                    // when known; null on a cold start matches
+                    // by address alone (the connect re-fetches
+                    // the list) — the server's own protocol
+                    // drives the Firefox-token logic.
+                    String proto = null;
+                    try {
+                        if (subCache != null) {
+                            for (Server a : subCache) {
+                                if (a != null && host.equals(a.ip)) { proto = a.proto; break; }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                    b.connectServer(host, "", proto);
+                    break;
+                }
+                case WidgetConnect.ACTION_CONNECT_FASTEST:
+                default:
+                    b.connectSubFastest();
+                    break;
+            }
+        } catch (Throwable ignored) {}
     }
 
     // sb12: Back must close the topmost overlay (app list,
@@ -284,6 +378,91 @@ public class MainActivity extends Activity {
         return "'" + s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'";
     }
 
+    /** Android System WebView major version (0 = unknown).
+     *  WebView.getCurrentWebViewPackage() (API 26+) first; the
+     *  WebView user-agent ("Chrome/<major>") as a fallback.
+     *  Used by the outdated-WebView prompt in the UI (2.7 fix3). */
+    private int webViewMajorVersion() {
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                android.content.pm.PackageInfo pi =
+                        android.webkit.WebView.getCurrentWebViewPackage();
+                if (pi != null && pi.versionName != null) {
+                    String v = pi.versionName.trim();
+                    int dot = v.indexOf('.');
+                    return Integer.parseInt(dot < 0 ? v : v.substring(0, dot));
+                }
+            }
+        } catch (Throwable ignored) {}
+        try {
+            String ua = android.webkit.WebSettings.getDefaultUserAgent(this);
+            return parseChromeMajor(ua);
+        } catch (Throwable ignored) {}
+        return 0;
+    }
+
+    /** Chrome major version from a WebView user-agent string
+     *  ("...Chrome/74.0.3729.185..."), or 0 when it cannot be
+     *  determined. Pure string logic, unit-testable. */
+    static int parseChromeMajor(String ua) {
+        try {
+            if (ua == null) return 0;
+            int i = ua.indexOf("Chrome/");
+            if (i < 0) return 0;
+            int s = i + 7, e = s;
+            while (e < ua.length() && Character.isDigit(ua.charAt(e))) e++;
+            if (e <= s) return 0;
+            return Integer.parseInt(ua.substring(s, e));
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
+    /** True when a WebView major version is too old for this
+     *  UI (below WEBVIEW_MIN_CHROME in index.html: the oldest
+     *  Chromium the UI needs after the old-engine cleanup is
+     *  59 — grid place-items — so 60 is the line). 0 (unknown)
+     *  never prompts — the app renders best effort instead. */
+    static boolean needsWebViewUpdate(int major) {
+        return major > 0 && major < 60;
+    }
+
+    /** 2.7 fix2: the server-list payload sent to the WebView —
+     *  {"servers":[{ip,flag,cc,port,proto,name}], "src":
+     *  "primary"|"backup"} — so the UI can show which
+     *  subscription the displayed list came from. Passwords /
+     *  uuids are never in the payload. */
+    private JSONObject serversPayload(List<Server> list) throws Exception {
+        JSONObject out = new JSONObject();
+        JSONArray arr = new JSONArray();
+        for (Server a : list) {
+            JSONObject o = new JSONObject();
+            o.put("ip", a.ip);
+            o.put("flag", a.flag == null ? "" : a.flag);
+            o.put("cc", a.countryCode == null ? "" : a.countryCode);
+            o.put("port", a.port);
+            o.put("proto", a.proto == null ? "ss" : a.proto);
+            o.put("name", a.name == null ? "" : a.name);
+            arr.put(o);
+        }
+        out.put("servers", arr);
+        // 3.1: the Firefox list reports its own source, so
+        // the UI pill shows "Firefox" instead of the stale
+        // subscription source.
+        out.put("src", AppSettings.isFirefoxMode(MainActivity.this)
+                ? "firefox" : SubscriptionApi.getLastSource());
+        return out;
+    }
+
+    /** 2.7 fix2: persist the learned IP->country map after a
+     *  successful fetch, so it survives restarts. */
+    private void persistIpCc() {
+        try {
+            String j = SubscriptionApi.ipCcJson();
+            if (j != null && !j.isEmpty()) AppSettings.saveIpCc(MainActivity.this, j);
+        } catch (Throwable ignored) {}
+    }
+
     public class Bridge {
         /** SS-only refresh — the single entry point for
          *  app open and the refresh button. Every refresh tries
@@ -298,7 +477,72 @@ public class MainActivity extends Activity {
          *  KEEPS the list it already has (the cached list shown
          *  on open) — the dropdown is never emptied by a
          *  failed refresh. The same {ip, flag, port, proto,
-         *  name} payload as refreshServers, never the password. */
+         *  name} payload as refreshSub, never the password. */
+        /** Android System WebView major version (0 = unknown),
+         *  for the JS outdated-WebView prompt. */
+        @JavascriptInterface
+        public int getWebViewVersion() {
+            try { return webViewMajorVersion(); } catch (Throwable ignored) { return 0; }
+        }
+
+        /** 3.1 fix3: the Android API level, so the JS shows
+         *  the "Add to Quick Settings" button only where the
+         *  system add-tile flow exists (API 33+). */
+        @JavascriptInterface
+        public int getApiLevel() {
+            try { return android.os.Build.VERSION.SDK_INT; }
+            catch (Throwable ignored) { return 0; }
+        }
+
+        /** 3.1 fix3: ask the system to add the ArcVeePN
+         *  Quick Settings tile (Android 13+ only — the JS
+         *  hides the button below API 33). The system shows
+         *  its own add-tile dialog; the result needs no
+         *  on-screen reporting. On older Android the user
+         *  adds the tile by hand from the QS editor. */
+        @JavascriptInterface
+        public void requestAddTile() {
+            try {
+                if (android.os.Build.VERSION.SDK_INT < 33) return;
+                android.app.StatusBarManager sbm = (android.app.StatusBarManager)
+                        getSystemService(android.content.Context.STATUS_BAR_SERVICE);
+                if (sbm == null) return;
+                sbm.requestAddTileService(
+                        new android.content.ComponentName(MainActivity.this,
+                                ArcVeePNTileService.class),
+                        "ArcVeePN",
+                        android.graphics.drawable.Icon.createWithResource(
+                                MainActivity.this, R.drawable.ic_stat_arc),
+                        getMainExecutor(),
+                        result -> {
+                            // The system dialog handles the
+                            // outcome; nothing to report.
+                        });
+            } catch (Throwable ignored) {}
+        }
+
+        /** Open the Play Store page for Android System WebView
+         *  (market:// first, https:// fallback). Used by the
+         *  outdated-WebView prompt in the UI. */
+        @JavascriptInterface
+        public void openWebViewUpdate() {
+            try {
+                runOnUiThread(() -> {
+                    try {
+                        Intent i = new Intent(Intent.ACTION_VIEW,
+                                android.net.Uri.parse("market://details?id=com.google.android.webview"));
+                        startActivity(i);
+                    } catch (Throwable e1) {
+                        try {
+                            Intent i2 = new Intent(Intent.ACTION_VIEW,
+                                    android.net.Uri.parse("https://play.google.com/store/apps/details?id=com.google.android.webview"));
+                            startActivity(i2);
+                        } catch (Throwable ignored) {}
+                    }
+                });
+            } catch (Throwable ignored) {}
+        }
+
         /** Open a URL outside the app (browser / Telegram).
          *  The new UI's "Project on GitHub" button and the
          *  Telegram join link use this — the WebViewClient
@@ -321,41 +565,247 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public void refreshServersForce() {
+        public void refreshSubForce() {
+            // 3.1: Firefox mode uses ONLY the Firefox servers —
+            // the refresh must never touch the subscriptions.
+            if (AppSettings.isFirefoxMode(MainActivity.this)) {
+                refreshFirefoxServers();
+                return;
+            }
             new Thread(() -> {
                 try {
                     try {
                         SubscriptionApi.refresh();
                         List<Server> list = new SubscriptionApi().fetchServers();
-                        serverCache = list;
+                        subCache = list;
                         ssCacheLoaded = false;
                         // v8: persist the raw subscription for
-                        // the offline cache (raw text, not the
-                        // password).
+                        // the offline cache (raw text only).
                         try {
                             String cacheJson = SubscriptionApi.lastFetchForCache();
                             if (cacheJson != null)
                                 AppSettings.saveCachedSs(MainActivity.this, cacheJson);
                         } catch (Throwable ignored) {}
-                        JSONArray arr = new JSONArray();
-                        for (Server a : list) {
-                            JSONObject o = new JSONObject();
-                            o.put("ip", a.ip);
-                            o.put("flag", a.flag == null ? "" : a.flag);
-                            o.put("port", a.port);
-                            o.put("proto", a.proto == null ? "ss" : a.proto);
-                            o.put("name", a.name == null ? "" : a.name);
-                            arr.put(o);
-                        }
-                        eval("window.onServers(" + jsString(arr.toString()) + ")");
+                        // 2.7 fix2: persist the learned IP->cc
+                        // map after a successful fetch.
+                        persistIpCc();
+                        eval("window.onServers(" + jsString(serversPayload(list).toString()) + ")");
+                        // 3.1 fix5: push the new source's
+                        // servers to the widget (header + list)
+                        // — fix4 never did this, so after
+                        // switching sources the widget kept
+                        // showing the previous source's servers
+                        // until the next connect/disconnect.
+                        pushWidgetAfterFetch();
                     } catch (Throwable e) {
-                        // Both subscriptions yielded nothing —
+                        // The primary yielded nothing (2.7 fix3:
+                        // no fallback to the emergency list) —
                         // keep the cached list on screen.
+                        try { ConnectLog.log(MainActivity.this, "servers failed: primary (" + SubscriptionApi.getLastPrimaryError() + ")"); } catch (Throwable ignored) {}
                         eval("window.onServersError("
                                 + jsString("Could not load servers.") + ")");
                     }
                 } catch (Throwable ignored) {}
             }).start();
+        }
+        /** 3.1: the Firefox refresh — fresh Remote Settings
+         *  list when possible, the cached list when the fetch
+         *  fails, the short generic error when there is
+         *  nothing at all. Same payload shape as the
+         *  subscription refresh, src "firefox". */
+        private void refreshFirefoxServers() {
+            new Thread(() -> {
+                try {
+                    try {
+                        List<Server> list =
+                                FirefoxAuth.getServers(MainActivity.this, true);
+                        subCache = list;
+                        ssCacheLoaded = false;
+                        eval("window.onServers(" + jsString(serversPayload(list).toString()) + ")");
+                        // 3.1 fix5: push the Firefox servers to
+                        // the widget (header + list) — see
+                        // pushWidgetAfterFetch.
+                        pushWidgetAfterFetch();
+                    } catch (Throwable e) {
+                        try { ConnectLog.log(MainActivity.this, "servers failed: firefox list"); } catch (Throwable ignored) {}
+                        eval("window.onServersError("
+                                + jsString("Could not load servers.") + ")");
+                    }
+                } catch (Throwable ignored) {}
+            }).start();
+        }
+        /** 3.1 fix5: push the current source's servers to
+         *  the home-screen widget (header + list) after a
+         *  successful fetch. fix4 never did this — the
+         *  widget only refreshed on connect / disconnect —
+         *  so after switching sources the widget kept showing
+         *  the previous source's servers until the next
+         *  connect. Safe from the fetch thread:
+         *  AppWidgetManager calls are thread-safe. */
+        private void pushWidgetAfterFetch() {
+            try { ArcVeePNWidget.updateAll(MainActivity.this); } catch (Throwable ignored) {}
+            try { ArcVeePNWidget.notifyDataChanged(MainActivity.this); } catch (Throwable ignored) {}
+        }
+        /** Manual emergency load (2.5 rebuild): fetch ONLY
+         *  the backup subscription (never the primary) and
+         *  show those servers. Called by the hamburger-menu
+         *  emergency button. The raw backup is persisted to
+         *  the offline cache like a normal fetch, so the
+         *  emergency servers survive an app restart. */
+        @JavascriptInterface
+        public void loadBackupServers() {
+            new Thread(() -> {
+                try {
+                    try {
+                        List<Server> list = new SubscriptionApi().fetchBackupServers();
+                        subCache = list;
+                        ssCacheLoaded = false;
+                        // Persist the raw backup for the
+                        // offline cache (raw text only).
+                        try {
+                            String cacheJson = SubscriptionApi.lastFetchForCache();
+                            if (cacheJson != null)
+                                AppSettings.saveCachedSs(MainActivity.this, cacheJson);
+                        } catch (Throwable ignored) {}
+                        // 2.7 fix2: persist the learned IP->cc map.
+                        persistIpCc();
+                        eval("window.onServers(" + jsString(serversPayload(list).toString()) + ")");
+                        // 3.1 fix5: push the emergency servers
+                        // to the widget (header + list) — see
+                        // pushWidgetAfterFetch.
+                        pushWidgetAfterFetch();
+                    } catch (Throwable e) {
+                        // The backup yielded nothing — keep
+                        // the cached list on screen.
+                        eval("window.onServersError("
+                                + jsString("Could not load servers.") + ")");
+                    }
+                } catch (Throwable ignored) {}
+            }).start();
+        }
+        /** 2.7 fix: the emergency TOGGLE (hamburger menu).
+         *  ON = persist the mode, point every fetch at the
+         *  BACKUP subscription, and load it NOW (the list is
+         *  replaced with the emergency servers immediately);
+         *  OFF = persist off, point fetches back at the
+         *  primary, and reload the primary. A failed backup
+         *  fetch keeps the cached list on screen and reports
+         *  the short generic "Could not load servers." — the
+         *  JS reverts the toggle when it hears that error. */
+        @JavascriptInterface
+        public void setEmergencyMode(final boolean on) {
+            try {
+                // 3.1: mutual exclusion — turning the emergency
+                // toggle ON turns the Firefox toggle OFF (the
+                // Firefox list must never mix with the backup).
+                if (on && AppSettings.isFirefoxMode(MainActivity.this)) {
+                    AppSettings.setFirefoxMode(MainActivity.this, false);
+                }
+                AppSettings.setEmergencyMode(MainActivity.this, on);
+                SubscriptionApi.setEmergencyMode(on);
+                // A mode switch must bypass the 30-min
+                // in-memory cache, or the toggle would keep
+                // showing the old list until the cache aged
+                // out.
+                SubscriptionApi.refresh();
+                if (on) {
+                    loadBackupServers();
+                } else {
+                    refreshSubForce();
+                }
+            } catch (Throwable ignored) {}
+        }
+        /** 3.1: the Firefox TOGGLE (hamburger menu). ON =
+         *  persist the mode, turn the emergency toggle OFF,
+         *  and load the Firefox list NOW (the list is replaced
+         *  with the Firefox servers immediately); OFF =
+         *  persist off and reload the primary subscription.
+         *  The JS only calls this when the user is signed in
+         *  (otherwise it opens the sign-in dialog first). A
+         *  failed list fetch keeps the cached list on screen
+         *  and reports the short generic "Could not load
+         *  servers." — the JS reverts the toggle then. */
+        @JavascriptInterface
+        public void setFirefoxMode(final boolean on) {
+            try {
+                AppSettings.setFirefoxMode(MainActivity.this, on);
+                if (on) {
+                    AppSettings.setEmergencyMode(MainActivity.this, false);
+                    SubscriptionApi.setEmergencyMode(false);
+                    SubscriptionApi.refresh();
+                    refreshFirefoxServers();
+                    refreshFirefoxQuota();
+                } else {
+                    SubscriptionApi.refresh();
+                    refreshSubForce();
+                }
+            } catch (Throwable ignored) {}
+        }
+        /** 3.1: open the Firefox sign-in dialog (Mozilla's own
+         *  page in a WebView). action is "login" or "signup".
+         *  The result comes back as window.onFirefoxLogin('ok'
+         *  | 'cancelled' | 'failed') — the JS turns the toggle
+         *  on only on 'ok'. */
+        @JavascriptInterface
+        public void openFirefoxLogin(final String action) {
+            try {
+                FirefoxLoginDialog.show(MainActivity.this,
+                        "signup".equals(action) ? "signup" : "login",
+                        status -> eval("window.onFirefoxLogin("
+                                + jsString(status) + ")"));
+            } catch (Throwable ignored) {}
+        }
+        /** 3.1: refresh the cached quota line in the
+         *  background (HEAD, no new token) and push it to the
+         *  UI as window.onFirefoxQuota({text}). A failure
+         *  leaves the old line in place, silently. */
+        @JavascriptInterface
+        public void refreshFirefoxQuota() {
+            new Thread(() -> {
+                try {
+                    FirefoxAuth.refreshQuotaCached(MainActivity.this);
+                    String line = FirefoxAuth.getQuotaLine(MainActivity.this);
+                    JSONObject o = new JSONObject();
+                    o.put("text", line);
+                    eval("window.onFirefoxQuota(" + jsString(o.toString()) + ")");
+                } catch (Throwable ignored) {}
+            }).start();
+        }
+        /** 3.1 fix: LOG OUT of the Firefox account. Clears
+         *  the stored tokens (OAuth access/refresh + ProxyPass
+         *  + expiries + email/quota), turns the Firefox toggle
+         *  OFF, and falls back to the GitHub primary — the
+         *  list reload shows Main servers only, never Firefox
+         *  ones (the cached Firefox list is only served while
+         *  Firefox mode is on). The JS disconnects first when
+         *  connected. Shows only the short generic sign-out
+         *  state via window.onFirefoxLogout(); no token is
+         *  ever shown or logged. */
+        @JavascriptInterface
+        public void logoutFirefox() {
+            try {
+                FirefoxAuth.clearAll(MainActivity.this);
+                AppSettings.setFirefoxMode(MainActivity.this, false);
+                VpnTunnelService.firefoxProxyPass = null;
+                SubscriptionApi.refresh();
+                refreshSubForce();
+                eval("window.onFirefoxLogout()");
+            } catch (Throwable ignored) {}
+        }
+        /** 3.1: the stored login died (refresh rejected) —
+         *  clear the tokens, turn Firefox mode off, reload the
+         *  primary, and tell the UI to show the sign-in state
+         *  again. Called from the connect path, never from the
+         *  UI directly. */
+        private void firefoxAuthLost() {
+            try {
+                FirefoxAuth.clearAll(MainActivity.this);
+                AppSettings.setFirefoxMode(MainActivity.this, false);
+                VpnTunnelService.firefoxProxyPass = null;
+                SubscriptionApi.refresh();
+                refreshSubForce();
+                eval("window.onFirefoxAuthLost()");
+            } catch (Throwable ignored) {}
         }
         /** The CACHED Shadowsocks list, shown IMMEDIATELY
          *  on app open while the fresh fetch runs in the
@@ -363,20 +813,61 @@ public class MainActivity extends Activity {
          *  "servers":[{ip,flag,port,proto,name}]} — the same
          *  payload shape as onServers. "cached" is false
          *  (and servers empty) when the app has never fetched
-         *  successfully. The SS cache is re-parsed with the
-         *  subscription bucket-roll refresh, so a cached SS server
-         *  stays valid after the credential bucket rolls. */
+         *  successfully. The SS cache is re-parsed exactly
+         *  like a fresh fetch. */
         @JavascriptInterface
         public String getCachedServers() {
             try {
+                // 3.1: Firefox mode serves the cached Firefox
+                // list (src "firefox") — never the subscription
+                // cache, which belongs to another source.
+                if (AppSettings.isFirefoxMode(MainActivity.this)) {
+                    List<Server> fx = FirefoxAuth.cachedServerList(MainActivity.this);
+                    JSONObject out = new JSONObject();
+                    out.put("cached", !fx.isEmpty());
+                    out.put("src", fx.isEmpty() ? "" : "firefox");
+                    JSONArray arr = new JSONArray();
+                    for (Server a : fx) {
+                        JSONObject o = new JSONObject();
+                        o.put("ip", a.ip);
+                        o.put("flag", a.flag == null ? "" : a.flag);
+                        o.put("cc", a.countryCode == null ? "" : a.countryCode);
+                        o.put("port", a.port);
+                        o.put("proto", a.proto == null ? "ss" : a.proto);
+                        o.put("name", a.name == null ? "" : a.name);
+                        arr.put(o);
+                    }
+                    out.put("servers", arr);
+                    if (!fx.isEmpty()) {
+                        subCache = fx;
+                        ssCacheLoaded = true;
+                    }
+                    return out.toString();
+                }
                 JSONObject out = new JSONObject();
                 List<Server> list = loadSsCache();
+                // 2.7 fix3: the toggle alone decides the source.
+                // A cached emergency list must never be shown
+                // while the toggle is OFF — it is stale data
+                // from an earlier emergency session, and showing
+                // it would auto-select the emergency source.
+                // The fresh primary refresh running on boot
+                // replaces it with the primary list.
+                if (!list.isEmpty() && !SubscriptionApi.isEmergencyMode()
+                        && "backup".equals(SubscriptionApi.getLastSource())) {
+                    list = new ArrayList<>();
+                }
                 out.put("cached", !list.isEmpty());
+                // 2.7 fix2: which subscription the cached list
+                // came from (set by parseCacheJson from the
+                // cache kind), so the UI can show the source.
+                out.put("src", list.isEmpty() ? "" : SubscriptionApi.getLastSource());
                 JSONArray arr = new JSONArray();
                 for (Server a : list) {
                     JSONObject o = new JSONObject();
                     o.put("ip", a.ip);
                     o.put("flag", a.flag == null ? "" : a.flag);
+                    o.put("cc", a.countryCode == null ? "" : a.countryCode);
                     o.put("port", a.port);
                     o.put("proto", a.proto == null ? "ss" : a.proto);
                     o.put("name", a.name == null ? "" : a.name);
@@ -384,8 +875,11 @@ public class MainActivity extends Activity {
                 }
                 out.put("servers", arr);
                 if (!list.isEmpty()) {
-                    serverCache = list;
+                    subCache = list;
                     ssCacheLoaded = true;
+                    // 2.7 fix2: the cache re-parse may have
+                    // taught the IP->cc map — persist it.
+                    persistIpCc();
                 }
                 return out.toString();
             } catch (Throwable ignored) {
@@ -393,40 +887,40 @@ public class MainActivity extends Activity {
             }
         }
 
-        /** Server v2: start a TCP-connect ping sweep over the
-         *  Server servers. Results stream to the WebView live
-         *  (onServerPing per server, onServerPingDone at the
+        /** Sub v2: start a TCP-connect ping sweep over the
+         *  Sub servers. Results stream to the WebView live
+         *  (onSubPing per server, onSubPingDone at the
          *  end); a sweep already running is not started twice. */
         @JavascriptInterface
-        public void pingServers() {
-            startServerPingSweep();
+        public void pingSub() {
+            startSubPingSweep();
         }
 
         /** Connect to one subscription server by IP + protocol
          *  ("ss" primary, "vmess" backup). Mirrors connect():
          *  proxy mode needs no VPN permission, otherwise the
-         *  VpnService.prepare flow with pendingIp/
-         *  pendingFlag/pendingProto (handled in
+         *  VpnService.prepare flow with pendingSubIp/
+         *  pendingSubFlag/pendingSubProto (handled in
          *  onActivityResult, like pendingRegion/pendingDisplay).
          *  The actual connect runs on a background thread in
-         *  doConnect. */
+         *  doConnectSub. */
         @JavascriptInterface
         public void connectServer(final String ip, final String flag, final String proto) {
             runOnUiThread(() -> {
                 try {
                     try { ConnectLog.clear(MainActivity.this); } catch (Throwable ignored) {}
                     if (AppSettings.isProxyMode(MainActivity.this)) {
-                        doConnect(ip, flag, proto);
+                        doConnectSub(ip, flag, proto);
                         return;
                     }
                     Intent prep = VpnService.prepare(MainActivity.this);
                     if (prep != null) {
-                        pendingIp = ip;
-                        pendingFlag = flag;
-                        pendingProto = proto;
+                        pendingSubIp = ip;
+                        pendingSubFlag = flag;
+                        pendingSubProto = proto;
                         startActivityForResult(prep, REQ_VPN);
                     } else {
-                        doConnect(ip, flag, proto);
+                        doConnectSub(ip, flag, proto);
                     }
                 } catch (Throwable t) {
                     lastError = "Connection failed.";
@@ -436,25 +930,32 @@ public class MainActivity extends Activity {
             });
         }
 
-        /** Server v2: Fastest mode — ping-test all servers and
+        /** Connect to one Shadowsocks server by IP (primary).
+         *  Kept for compatibility; delegates to connectServer. */
+        @JavascriptInterface
+        public void connectSub(final String ip, final String flag) {
+            connectServer(ip, flag, "ss");
+        }
+
+        /** Sub v2: Fastest mode — ping-test all servers and
          *  switch live to the best found so far. Same VPN
-         *  permission flow as connectServer (pendingFastest
+         *  permission flow as connectSub (pendingSubFastest
          *  is resumed in onActivityResult). */
         @JavascriptInterface
-        public void connectFastest() {
+        public void connectSubFastest() {
             runOnUiThread(() -> {
                 try {
                     try { ConnectLog.clear(MainActivity.this); } catch (Throwable ignored) {}
                     if (AppSettings.isProxyMode(MainActivity.this)) {
-                        doConnectFastest();
+                        doConnectSubFastest();
                         return;
                     }
                     Intent prep = VpnService.prepare(MainActivity.this);
                     if (prep != null) {
-                        pendingFastest = true;
+                        pendingSubFastest = true;
                         startActivityForResult(prep, REQ_VPN);
                     } else {
-                        doConnectFastest();
+                        doConnectSubFastest();
                     }
                 } catch (Throwable t) {
                     lastError = "Connection failed.";
@@ -472,13 +973,13 @@ public class MainActivity extends Activity {
             connecting = false;
             lastError = "";
             watchdogStop = true;
-            // Server v2: leaving Fastest mode + forget the
-            // connected Server server (bumping the fastest
+            // Sub v2: leaving Fastest mode + forget the
+            // connected Sub server (bumping the fastest
             // epoch stops any sweep from switching afterwards).
-            fastestServer = false;
-            fastestServerEpoch++;
-            connectedServerIp = null;
-            connectedServerMs = Long.MAX_VALUE;
+            subFastest = false;
+            subFastestEpoch++;
+            subConnectedIp = null;
+            subConnectedMs = Long.MAX_VALUE;
             runOnUiThread(() -> {
                 // sb15 HARDENING: startService is guarded — an
                 // IllegalStateException here (app backgrounded)
@@ -534,6 +1035,15 @@ public class MainActivity extends Activity {
             try {
                 if (!VpnTunnelService.running) return;
                 if (connecting) return;
+                // 3.1 fix: the Firefox renewal loop flags a
+                // terminal refresh failure here (dead login /
+                // spent quota) — run the existing generic
+                // auth-lost path once, then continue. This is
+                // the only place the service's flag is consumed.
+                if (VpnTunnelService.consumeFirefoxAuthLostIfDue()) {
+                    new Bridge().firefoxAuthLost();
+                    return;
+                }
                 if (!VpnTunnelService.consumeNetChangeIfDue()) return;
                 ConnectLog.log(MainActivity.this,
                         "netchange: reconnecting after network change");
@@ -569,18 +1079,42 @@ public class MainActivity extends Activity {
             }).start();
         }
 
+        /** 3.1 fix7: the exit-IP box's server identity, as a pure
+         *  function (unit-testable). subConnectedIp is set only
+         *  by the IN-APP connect flow (startServiceWithServer);
+         *  a widget/tile-started connection never sets it, so
+         *  getStatusJson used to report subIp="" and the JS
+         *  paintConn() — which shows the IP only when it can
+         *  find the connected server in the list — showed
+         *  nothing, even with a live tunnel and a known exit
+         *  IP. Fall back to the service's running server,
+         *  which the widget path DOES set (DirectConnect sets
+         *  currentServer before starting the service; the
+         *  service copies it to runningServer). */
+        static String resolveSubIpForStatus(String subConnectedIp,
+                Server runningServer) {
+            if (subConnectedIp != null && !subConnectedIp.isEmpty()) {
+                return subConnectedIp;
+            }
+            if (runningServer != null && runningServer.ip != null
+                    && !runningServer.ip.isEmpty()) {
+                return runningServer.ip;
+            }
+            return "";
+        }
+
         @JavascriptInterface
         public String getStatusJson() {
             try {
                 JSONObject o = new JSONObject();
                 boolean connected = VpnTunnelService.running;
                 if (connected) connecting = false;
-                // Server v2: while a Fastest sweep is still
+                // Sub v2: while a Fastest sweep is still
                 // testing, never auto-fail the connect — the
                 // sweep owns the outcome and reports it
                 // (onConnectError) when it ends.
-                boolean sweeping = pingThread != null && pingThread.isAlive();
-                if (connecting && !sweeping && System.currentTimeMillis() - connectingSince > 20000 && !connected) {
+                boolean subSweeping = subPingThread != null && subPingThread.isAlive();
+                if (connecting && !subSweeping && System.currentTimeMillis() - connectingSince > 20000 && !connected) {
                     connecting = false;
                     if (lastError == null || lastError.isEmpty()) lastError = "Connection failed.";
                 }
@@ -623,12 +1157,13 @@ public class MainActivity extends Activity {
                 o.put("socksPort", SOCKS_PORT);
                 o.put("httpPort", HTTP_PORT);
                 o.put("ip", lastIp);
-                // Server v2: connected Server server IP ("" when
+                // Sub v2: connected Sub server IP ("" when
                 // none), Fastest live-switch state, and whether
                 // a ping sweep is still testing.
-                o.put("serverIp", connectedServerIp == null ? "" : connectedServerIp);
-                o.put("fastestServer", fastestServer);
-                o.put("serverTesting", sweeping);
+                o.put("subIp", resolveSubIpForStatus(subConnectedIp,
+                        VpnTunnelService.runningServer));
+                o.put("subFastest", subFastest);
+                o.put("subTesting", subSweeping);
                 o.put("ssCached", ssCacheLoaded);
                 return o.toString();
             } catch (Throwable e) {
@@ -700,6 +1235,16 @@ public class MainActivity extends Activity {
                 // sb14: the last server the user picked, so the
                 // app can reopen on it (first launch = Fastest).
                 o.put("lastSelection", AppSettings.getLastSelection(MainActivity.this));
+                // 2.7 fix: the emergency toggle state, so the
+                // hamburger menu paints the switch correctly.
+                o.put("emergencyMode", AppSettings.isEmergencyMode(MainActivity.this));
+                // 3.1: the Firefox toggle + sign-in state, so
+                // the hamburger menu paints the switch, the
+                // account line and the quota line correctly.
+                o.put("firefoxMode", AppSettings.isFirefoxMode(MainActivity.this));
+                o.put("firefoxLoggedIn", FirefoxAuth.isLoggedIn(MainActivity.this));
+                o.put("firefoxEmail", FirefoxAuth.getEmail(MainActivity.this));
+                o.put("firefoxQuota", FirefoxAuth.getQuotaLine(MainActivity.this));
                 JSONArray arr = new JSONArray();
                 for (String p : AppSettings.getSplitPackages(MainActivity.this)) arr.put(p);
                 o.put("splitPackages", arr);
@@ -856,21 +1401,21 @@ public class MainActivity extends Activity {
         try {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_VPN) {
-            if (resultCode == RESULT_OK && pendingIp != null) {
-                // Server: the VPN permission flow.
-                String ip = pendingIp, fl = pendingFlag, pr = pendingProto;
-                pendingIp = null; pendingFlag = null; pendingProto = null;
-                doConnect(ip, fl, pr);
-            } else if (resultCode == RESULT_OK && pendingFastest) {
-                // Server v2: Fastest was waiting on permission.
-                pendingFastest = false;
-                doConnectFastest();
+            if (resultCode == RESULT_OK && pendingSubIp != null) {
+                // Sub: the VPN permission flow.
+                String ip = pendingSubIp, fl = pendingSubFlag, pr = pendingSubProto;
+                pendingSubIp = null; pendingSubFlag = null; pendingSubProto = null;
+                doConnectSub(ip, fl, pr);
+            } else if (resultCode == RESULT_OK && pendingSubFastest) {
+                // Sub v2: Fastest was waiting on permission.
+                pendingSubFastest = false;
+                doConnectSubFastest();
             } else {
                 // Permission denied (or cancelled): drop any
-                // stale pending Server request so a later grant
+                // stale pending Sub request so a later grant
                 // cannot resume the wrong one.
-                pendingIp = null; pendingFlag = null; pendingProto = null;
-                pendingFastest = false;
+                pendingSubIp = null; pendingSubFlag = null; pendingSubProto = null;
+                pendingSubFastest = false;
                 lastError = "VPN permission was not granted.";
                 eval("window.onConnectError(" + jsString(lastError) + ")");
             }
@@ -919,30 +1464,30 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Server (TEST): user-initiated connect to one Server
+    /** Sub (TEST): user-initiated connect to one Sub
      *  Shadowsocks server. Same epoch discipline as doConnect:
      *  a newer attempt supersedes this one silently.
-     *  Server v2: picking a server by hand cancels Fastest
+     *  Sub v2: picking a server by hand cancels Fastest
      *  mode (bumping the fastest epoch stops any sweep from
      *  switching afterwards). */
-    private void doConnect(String ip, String flag, String proto) {
-        fastestServer = false;
-        fastestServerEpoch++;
-        doConnectInternal(ip, flag, proto);
+    private void doConnectSub(String ip, String flag, String proto) {
+        subFastest = false;
+        subFastestEpoch++;
+        doConnectSubInternal(ip, flag, proto);
     }
 
-    /** Server v2: the shared connect entry for a single Server
+    /** Sub v2: the shared connect entry for a single Sub
      *  server — used by the user path and by the Fastest
      *  live-switch. On failure while Fastest is on, the next
      *  best server is tried instead of erroring right away. */
-    private void doConnectInternal(String ip, String flag, String proto) {
+    private void doConnectSubInternal(String ip, String flag, String proto) {
         final long epoch = ++connectEpoch;
         new Thread(() -> {
-            boolean ok = connectServerSync(ip, flag, proto, epoch);
+            boolean ok = connectSubSync(ip, flag, proto, epoch);
             if (!ok && epoch == connectEpoch) {
-                if (fastestServer) {
-                    failedIps.add(ip);
-                    if (!maybeSwitchFastest(fastestServerEpoch)) {
+                if (subFastest) {
+                    subFailedIps.add(ip);
+                    if (!maybeSwitchSubFastest(subFastestEpoch)) {
                         if (!VpnTunnelService.running && !connecting) {
                             eval("window.onConnectError(" + jsString(lastError) + ")");
                         }
@@ -954,24 +1499,24 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    /** Server v2: Fastest mode — start a ping sweep and switch
+    /** Sub v2: Fastest mode — start a ping sweep and switch
      *  live to the best server as results arrive. No server is
      *  picked up front; the sweep's first good result triggers
-     *  the first connect (see maybeSwitchFastest). */
-    private void doConnectFastest() {
-        fastestServer = true;
-        fastestServerEpoch++;
-        serverBestIp = null;
-        serverBestMs = Long.MAX_VALUE;
-        failedIps.clear();
+     *  the first connect (see maybeSwitchSubFastest). */
+    private void doConnectSubFastest() {
+        subFastest = true;
+        subFastestEpoch++;
+        subBestIp = null;
+        subBestMs = Long.MAX_VALUE;
+        subFailedIps.clear();
         try { AppSettings.setLastSelection(MainActivity.this, AppSettings.SEL_FASTEST); } catch (Throwable ignored) {}
         // NOTE: `connecting` is deliberately NOT set here —
-        // maybeSwitchFastest refuses to switch while it is
+        // maybeSwitchSubFastest refuses to switch while it is
         // set, and the sweep must be free to start the first
         // connect. The WebView stays on "Connecting…" from
-        // its own state + the serverTesting status flag (see
+        // its own state + the subTesting status flag (see
         // poll); `connecting` is set by the switch itself.
-        startServerPingSweep();
+        startSubPingSweep();
         // v7: if a background sweep is already running, the
         // start above is a no-op (the guard) — try an
         // immediate switch to the best server measured so
@@ -979,23 +1524,23 @@ public class MainActivity extends Activity {
         // once instead of waiting for the running sweep to
         // end. No-op when nothing is measured yet (the
         // running sweep's next result then switches, via
-        // the live fastestServer check in the sweep thread).
-        maybeSwitchFastest(fastestServerEpoch);
+        // the live subFastest check in the sweep thread).
+        maybeSwitchSubFastest(subFastestEpoch);
     }
 
-    /** One TCP-connect probe to an Server VMess server
+    /** One TCP-connect probe to an Sub VMess server
      *  (ip:port): the time to establish the TCP connection,
      *  or -1 when it does not answer within the timeout.
      *  VMess-only — Shadowsocks servers use the real
      *  handshake probe (SsProbe) instead, because a port
      *  that answers TCP is not proof the SS service behind
      *  it works. */
-    private long tcpProbeServer(String ip, int port) {
+    private long tcpProbeSub(String ip, int port) {
         Socket sock = null;
         try {
             long t0 = System.currentTimeMillis();
             sock = new Socket();
-            sock.connect(new InetSocketAddress(ip, port), PING_TIMEOUT_MS);
+            sock.connect(new InetSocketAddress(ip, port), SUB_PING_TIMEOUT_MS);
             return System.currentTimeMillis() - t0;
         } catch (Throwable ignored) {
             return -1;
@@ -1004,35 +1549,35 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Server v2: ping sweep over the subscription servers
+    /** Sub v2: ping sweep over the subscription servers
      *  (20 parallel probes). Shadowsocks servers get a REAL
      *  handshake probe (SsProbe — full AEAD handshake +
      *  relay, so a dead SS service reads TIMEOUT instead of
      *  a fake ~60 ms TCP connect); VMess servers keep the
      *  TCP-connect probe. Every result is streamed to the
-     *  WebView as it arrives (onServerPing) so the list
+     *  WebView as it arrives (onSubPing) so the list
      *  lights up live; in Fastest mode each result is also a
-     *  chance to switch (maybeSwitchFastest). A sweep
+     *  chance to switch (maybeSwitchSubFastest). A sweep
      *  already running is not started twice. At the end, a
      *  Fastest sweep that connected to nothing and found no
      *  usable server reports the error — a sweep that is
      *  mid-connect, or that already connected, stays silent.
-     *  v7: the sweep checks the LIVE fastestServer state
+     *  v7: the sweep checks the LIVE subFastest state
      *  (not a flag captured at start) — a Fastest tap while
      *  a background sweep is already running must adopt
      *  that sweep, so its results switch live instead of
      *  the tap silently doing nothing. */
-    private synchronized void startServerPingSweep() {
-        if (pingThread != null && pingThread.isAlive()) return;
-        pingThread = new Thread(() -> {
+    private synchronized void startSubPingSweep() {
+        if (subPingThread != null && subPingThread.isAlive()) return;
+        subPingThread = new Thread(() -> {
             try {
-                List<Server> list = serverCache;
+                List<Server> list = subCache;
                 if (list == null || list.isEmpty()) {
-                    try { list = new SubscriptionApi().fetchServers(); serverCache = list; }
+                    try { list = fetchCurrentServers(); subCache = list; }
                     catch (Throwable ignored) { list = new ArrayList<>(); }
                 }
                 if (list.isEmpty()) {
-                    if (fastestServer
+                    if (subFastest
                             && !VpnTunnelService.running && !connecting) {
                         eval("window.onConnectError("
                                 + jsString("Could not load servers.") + ")");
@@ -1044,16 +1589,22 @@ public class MainActivity extends Activity {
                     final Server sv = a;
                     ex.submit(() -> {
                         long ms;
-                        if ("vmess".equals(sv.proto)) {
-                            ms = tcpProbeServer(sv.ip, sv.port);
+                        if ("vmess".equals(sv.proto) || "firefox".equals(sv.proto)) {
+                            // TCP-connect probe: VMess has no
+                            // handshake probe, and a Firefox
+                            // server answers CONNECT only with a
+                            // valid Bearer token — a bare TCP
+                            // connect is the only pre-connect
+                            // signal that the host is alive.
+                            ms = tcpProbeSub(sv.ip, sv.port);
                         } else {
                             // Real SS handshake probe: validates
                             // the whole path (handshake + relay).
                             // -1 = TIMEOUT (dead server).
                             ms = SsProbe.probe(sv.ip, sv.port, sv.method,
-                                    sv.password, PING_TIMEOUT_MS);
+                                    sv.password, SUB_PING_TIMEOUT_MS);
                         }
-                        serverPingMs.put(sv.ip, ms);
+                        subPingMs.put(sv.ip, ms);
                         try {
                             JSONObject o = new JSONObject();
                             o.put("ip", sv.ip);
@@ -1062,11 +1613,11 @@ public class MainActivity extends Activity {
                             // server identity).
                             o.put("port", sv.port);
                             o.put("pingMs", ms);
-                            eval("window.onServerPing(" + jsString(o.toString()) + ")");
+                            eval("window.onSubPing(" + jsString(o.toString()) + ")");
                         } catch (Throwable ignored) {}
-                        // v7: live fastestServer — a Fastest tap
+                        // v7: live subFastest — a Fastest tap
                         // mid-sweep adopts this running sweep.
-                        if (fastestServer) maybeSwitchFastest(fastestServerEpoch);
+                        if (subFastest) maybeSwitchSubFastest(subFastestEpoch);
                     });
                 }
                 ex.shutdown();
@@ -1078,57 +1629,79 @@ public class MainActivity extends Activity {
                 } catch (InterruptedException e) {
                     ex.shutdownNow();
                 }
-                if (fastestServer
+                if (subFastest
                         && !VpnTunnelService.running && !connecting
-                        && computeServerBest() == null) {
+                        && computeSubBest() == null) {
                     eval("window.onConnectError(" + jsString("Could not connect to any server.") + ")");
                 }
             } catch (Throwable ignored) {
             } finally {
-                eval("window.onServerPingDone()");
+                // 3.1 fix4: persist the sweep's ping table +
+                // best server for the home-screen widget.
+                saveWidgetPingState();
+                eval("window.onSubPingDone()");
             }
-        }, "arcveepn-server-ping");
-        pingThread.setDaemon(true);
-        pingThread.start();
+        }, "arcveepn-sub-ping");
+        subPingThread.setDaemon(true);
+        subPingThread.start();
     }
 
-    /** Best (lowest-ms) Server server from the last ping sweep,
+    /** 3.1 fix4: persist the sweep's ping table + best
+     *  server for the home-screen widget, which ranks its
+     *  list and shows the best server's flag from the
+     *  persisted data (it has no access to the app's
+     *  in-memory sweep results). */
+    private void saveWidgetPingState() {
+        try {
+            AppSettings.saveWidgetPings(this, new java.util.HashMap<>(subPingMs));
+            String bestIp = computeSubBest();
+            if (bestIp != null && subCache != null) {
+                String flag = "";
+                for (Server a : subCache) {
+                    if (bestIp.equals(a.ip)) { flag = a.flag == null ? "" : a.flag; break; }
+                }
+                AppSettings.saveWidgetBest(this, bestIp, flag);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /** Best (lowest-ms) Sub server from the last ping sweep,
      *  skipping failures and servers a Fastest connect already
-     *  tried and failed. Updates serverBestIp/serverBestMs.
+     *  tried and failed. Updates subBestIp/subBestMs.
      *  Null = no usable server measured yet. */
-    private synchronized String computeServerBest() {
+    private synchronized String computeSubBest() {
         String bestIp = null;
         long bestMs = Long.MAX_VALUE;
-        for (Map.Entry<String, Long> e : serverPingMs.entrySet()) {
+        for (Map.Entry<String, Long> e : subPingMs.entrySet()) {
             if (e.getValue() == null || e.getValue() < 0) continue;
-            if (failedIps.contains(e.getKey())) continue;
+            if (subFailedIps.contains(e.getKey())) continue;
             if (e.getValue() < bestMs) { bestMs = e.getValue(); bestIp = e.getKey(); }
         }
-        serverBestIp = bestIp;
-        serverBestMs = bestIp == null ? Long.MAX_VALUE : bestMs;
+        subBestIp = bestIp;
+        subBestMs = bestIp == null ? Long.MAX_VALUE : bestMs;
         return bestIp;
     }
 
-    /** Server v2 Fastest live-switch: while a Fastest sweep is
+    /** Sub v2 Fastest live-switch: while a Fastest sweep is
      *  running, switch to the best server found SO FAR — as
      *  results arrive, not only when the sweep ends. Only
      *  switches when the new best is at least
-     *  FASTEST_MIN_GAIN_MS better than the server we
+     *  SUB_FASTEST_MIN_GAIN_MS better than the server we
      *  are on, so near-equal results never flap the tunnel.
      *  `connecting` is set synchronously here, so two results
      *  landing at once cannot start two connects. Returns
      *  true when a connect was started. */
-    private synchronized boolean maybeSwitchFastest(long fEpoch) {
-        if (!fastestServer || fEpoch != fastestServerEpoch) return false;
+    private synchronized boolean maybeSwitchSubFastest(long fEpoch) {
+        if (!subFastest || fEpoch != subFastestEpoch) return false;
         if (connecting) return false;
-        String bestIp = computeServerBest();
+        String bestIp = computeSubBest();
         if (bestIp == null) return false;
-        if (bestIp.equals(connectedServerIp)) return false;
-        if (connectedServerIp != null
-                && serverBestMs >= connectedServerMs - FASTEST_MIN_GAIN_MS) return false;
+        if (bestIp.equals(subConnectedIp)) return false;
+        if (subConnectedIp != null
+                && subBestMs >= subConnectedMs - SUB_FASTEST_MIN_GAIN_MS) return false;
         String flag = "";
         String proto = "ss";
-        List<Server> list = serverCache;
+        List<Server> list = subCache;
         if (list != null) {
             for (Server a : list) {
                 if (a != null && bestIp.equals(a.ip)) {
@@ -1140,14 +1713,25 @@ public class MainActivity extends Activity {
         }
         connecting = true;
         connectingSince = System.currentTimeMillis();
-        doConnectInternal(bestIp, flag, proto);
+        doConnectSubInternal(bestIp, flag, proto);
         return true;
     }
 
 
+    /** 3.1: the server list for the CURRENT source — the
+     *  Firefox list when Firefox mode is on, the
+     *  subscription fetch otherwise. Used by the connect
+     *  and ping-sweep fallbacks, so they never fetch the
+     *  wrong source when the cache is empty. */
+    private List<Server> fetchCurrentServers() throws Exception {
+        if (AppSettings.isFirefoxMode(this)) {
+            return FirefoxAuth.getServers(this, true);
+        }
+        return new SubscriptionApi().fetchServers();
+    }
+
     /** v8: the cached SS list (empty when never fetched).
-     *  Re-parsed  exactly like a fresh fetch,
-     *  with the subscription bucket-roll refresh applied. */
+     *  Re-parsed exactly like a fresh fetch. */
     private List<Server> loadSsCache() {
         try {
             return SubscriptionApi.parseCacheJson(AppSettings.getCachedSs(this));
@@ -1156,24 +1740,24 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Server (TEST): single-server connect, synchronous. No
+    /** Sub (TEST): single-server connect, synchronous. No
      *  ping/ranking fallbacks (one server, one attempt) — the
      *  server comes from the cached subscription list,
      *  re-fetched fresh if the cache is empty. Returns true
      *  only when the tunnel is actually running for THIS
-     *  server. Sets the Server statics AFTER the stop-and-wait:
+     *  server. Sets the Sub statics AFTER the stop-and-wait:
      *  stopTunnel() clears currentServer, so setting it
      *  before the stop would leave startTunnel with nothing
      *  to build. */
-    private boolean connectServerSync(String ip, String flag, String proto, long epoch) {
+    private boolean connectSubSync(String ip, String flag, String proto, long epoch) {
         lastError = "";
         connecting = true;
         connectingSince = System.currentTimeMillis();
-        currentRegionCode = "server";
+        currentRegionCode = "sub";
         optimizeCount = 0;
         try {
             Server server = null;
-            List<Server> list = serverCache;
+            List<Server> list = subCache;
             if (list != null) {
                 for (Server a : list) {
                     if (a != null && ip.equals(a.ip)
@@ -1182,8 +1766,8 @@ public class MainActivity extends Activity {
             }
             if (server == null) {
                 try {
-                    List<Server> fresh = new SubscriptionApi().fetchServers();
-                    serverCache = fresh;
+                    List<Server> fresh = fetchCurrentServers();
+                    subCache = fresh;
                     for (Server a : fresh) {
                         if (a != null && ip.equals(a.ip)
                                 && (proto == null || proto.equals(a.proto))) { server = a; break; }
@@ -1215,6 +1799,31 @@ public class MainActivity extends Activity {
                 if (VpnTunnelService.running) return false;
             }
             if (!epochAlive(epoch)) return false;
+            // 3.1: a Firefox server needs a fresh ProxyPass JWT
+            // for the CONNECT (Bearer). Fetched here, on the
+            // connect thread, in memory only — a failure (or a
+            // dead login) fails this connect with the generic
+            // message, exactly like an unreachable server.
+            // Any other protocol clears the slot so a stale
+            // token can never leak into its config.
+            String ffxPass = null;
+            if ("firefox".equals(server.proto)) {
+                try {
+                    ffxPass = FirefoxAuth.ensureProxyPass(MainActivity.this);
+                } catch (FirefoxAuth.FfxException e) {
+                    if (e.reauth) {
+                        try { new Bridge().firefoxAuthLost(); } catch (Throwable ignored) {}
+                    }
+                } catch (Throwable ignored) {}
+                if (ffxPass == null || ffxPass.isEmpty()) {
+                    if (epoch == connectEpoch) {
+                        connecting = false;
+                        lastError = "Could not connect to this server.";
+                    }
+                    return false;
+                }
+            }
+            VpnTunnelService.firefoxProxyPass = ffxPass;
             VpnTunnelService.currentServer = server;
             VpnTunnelService.currentRegion = display;
             VpnTunnelService.proxyMode = AppSettings.isProxyMode(this);
@@ -1251,17 +1860,23 @@ public class MainActivity extends Activity {
             // the ping poller, so its first iteration already
             // measures the through-tunnel RTT for this server
             // (otherwise the first RTT would wait a full
-            // 30 s sleep, because connectedServerIp was null).
-            connectedServerIp = ip;
-            connectedServerMs = serverPingMs.getOrDefault(ip, Long.MAX_VALUE);
+            // 30 s sleep, because subConnectedIp was null).
+            subConnectedIp = ip;
+            subConnectedMs = subPingMs.getOrDefault(ip, Long.MAX_VALUE);
+            // 3.1 fix4: remember the Fastest pick for the
+            // small widget's flag.
+            if (subFastest) {
+                try { AppSettings.saveWidgetBest(MainActivity.this, ip, flag == null ? "" : flag); }
+                catch (Throwable ignored) {}
+            }
             startSbPingPoller();
             new Bridge().checkExitIp();
-            // Server v2: re-evaluate Fastest — a better server
+            // Sub v2: re-evaluate Fastest — a better server
             // may have been measured while this connect was in
             // flight, so switch to it now instead of waiting
             // for the next sweep.
             connecting = false;
-            if (fastestServer) maybeSwitchFastest(fastestServerEpoch);
+            if (subFastest) maybeSwitchSubFastest(subFastestEpoch);
             return true;
         } catch (Throwable e) {
             if (epoch == connectEpoch) {
@@ -1283,7 +1898,7 @@ public class MainActivity extends Activity {
      *  Clash stays only for sing-box's internal urltest use. A
      *  failed probe leaves lastSbPingMs at -1 and the JS keeps
      *  the previous displayed value.
-     *  v5: while an Server server is connected, the poller
+     *  v5: while an Sub server is connected, the poller
      *  measures the through-tunnel RTT (tunnelRttMs, best of
      *  two) and publishes it as lastSbPingMs, so the JS shows
      *  the Speedtest-like value instead of the pre-connect
@@ -1297,7 +1912,7 @@ public class MainActivity extends Activity {
             while (!watchdogStop && VpnTunnelService.running) {
                 boolean ok = false;
                 try {
-                    if (connectedServerIp != null) {
+                    if (subConnectedIp != null) {
                         long a = tunnelRttMs();
                         long b = tunnelRttMs();
                         long best = -1;
@@ -1316,7 +1931,7 @@ public class MainActivity extends Activity {
                 // connect instead of showing the pre-connect
                 // SsProbe value for a whole interval.
                 long sleepMs;
-                if (connectedServerIp != null) sleepMs = ok ? 10000 : 2000;
+                if (subConnectedIp != null) sleepMs = ok ? 10000 : 2000;
                 else sleepMs = 30000;
                 try {
                     Thread.sleep(sleepMs);
@@ -1330,13 +1945,13 @@ public class MainActivity extends Activity {
         final long epoch = ++connectEpoch;
         final String region = currentRegionCode;
         final String display = currentDisplay;
-        // Server v2: the same snapshot for an Server tunnel.
-        final boolean aFast = fastestServer;
-        final String aIp = connectedServerIp;
+        // Sub v2: the same snapshot for an Sub tunnel.
+        final boolean aFast = subFastest;
+        final String aIp = subConnectedIp;
         String aFl = "";
         String aPr = "ss";
-        if (aIp != null && serverCache != null) {
-            for (Server a : serverCache) {
+        if (aIp != null && subCache != null) {
+            for (Server a : subCache) {
                 if (a != null && aIp.equals(a.ip)) {
                     aFl = a.flag == null ? "" : a.flag;
                     aPr = a.proto == null ? "ss" : a.proto;
@@ -1365,14 +1980,14 @@ public class MainActivity extends Activity {
                             "netchange: old tunnel still up, abort");
                     return;
                 }
-                // Network change on an Server tunnel — Fastest
+                // Network change on an Sub tunnel — Fastest
                 // re-tests from scratch, a fixed server
                 // re-establishes the SAME server.
-                if ("server".equals(region)) {
-                    if (aFast) { doConnectFastest(); return; }
-                    if (aIp != null) { doConnectInternal(aIp, aFlag, aProto); return; }
+                if ("sub".equals(region)) {
+                    if (aFast) { doConnectSubFastest(); return; }
+                    if (aIp != null) { doConnectSubInternal(aIp, aFlag, aProto); return; }
                     ConnectLog.log(MainActivity.this,
-                            "netchange: no server server, abort");
+                            "netchange: no sub server, abort");
                     return;
                 }
                 ConnectLog.log(MainActivity.this,

@@ -20,12 +20,62 @@
         <activity
             android:name="com.vpeen.android.MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- 3.1 fix3: home-screen widget. -->
+        <receiver
+            android:name="com.vpeen.android.ArcVeePNWidget"
+            android:exported="false"
+            android:label="ArcVeePN">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_info" />
+        </receiver>
+
+        <!-- 3.1 fix4: the large widget's scrollable server
+             list. A RemoteViewsService must carry the
+             BIND_REMOTEVIEWS permission; it is not exported. -->
+        <service
+            android:name="com.vpeen.android.WidgetListService"
+            android:exported="false"
+            android:permission="android.permission.BIND_REMOTEVIEWS" />
+        <!-- 3.1 fix3: Quick Settings tile. 3.1 fix4: the tile
+             was listed in the QS editor but GREYED OUT and
+             could not be added, while Arman VPN's tile (same
+             phone) adds fine. The declaration was missing the
+             two meta-data the Android TileService docs and
+             Arman both carry: TOGGLEABLE_TILE (this tile IS a
+             two-state switch — ACTIVE/INACTIVE) and ACTIVE_TILE
+             (without it, TileService.requestListeningState —
+             which requestTileUpdate() calls on every connect /
+             disconnect — is documented to do NOTHING, so the
+             tile state could never refresh while hidden).
+             android:enabled is now explicit too. -->
+        <service
+            android:name="com.vpeen.android.ArcVeePNTileService"
+            android:exported="true"
+            android:enabled="true"
+            android:icon="@drawable/ic_stat_arc"
+            android:label="ArcVeePN"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true" />
+            <meta-data
+                android:name="android.service.quicksettings.ACTIVE_TILE"
+                android:value="true" />
+        </service>
         <service
             android:name="com.vpeen.android.VpnTunnelService"
             android:exported="false"

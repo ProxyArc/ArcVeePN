@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 3.1 fix4: the SMALL (1x1) widget. One app-icon cell:
+     the FLAG of the last connected server's country (or
+     the best server's flag when Fastest is selected),
+     plus a small status dot (green = connected, grey =
+     disconnected). The whole cell is one tap target
+     (widget_small_root): connect directly, or disconnect
+     when connected — without opening the app. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_small_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_bg">
+    <TextView
+        android:id="@+id/widget_flag"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:text="&#127760;"
+        android:textSize="28sp" />
+    <TextView
+        android:id="@+id/widget_dot"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_marginEnd="6dp"
+        android:layout_marginBottom="4dp"
+        android:text="&#9679;"
+        android:textColor="#9aa7bd"
+        android:textSize="10sp" />
+</FrameLayout>
