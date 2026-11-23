@@ -327,8 +327,13 @@ public final class DirectConnect {
                     if (st == CONNECT_FELL_BACK) return;
                     if (st == CONNECT_STOP_TIMEOUT) return;
                     if (st == CONNECT_PENDING) return;
-                    // CONNECT_FAILED: the server was dead —
-                    // try the next best.
+                    // CONNECT_FAILED: the server could not
+                    // be STARTED (no pass, VPN prepare
+                    // threw, a transient throw) — try the
+                    // next best. A probe miss no longer
+                    // fails the attempt (3.1 fix10): the
+                    // first server stays up and returns OK,
+                    // so the loop never reaches here for it.
                 }
                 // 3.1 fix9: all attempts dead — stay put.
                 // The old code fell back to the app here, so
@@ -366,19 +371,21 @@ public final class DirectConnect {
             }
         }
 
-        /** connectResolved outcomes: OK = tunnel up and
-         *  verified; STOP_TIMEOUT = the old tunnel is
-         *  still serving (stop did not clear in 5 s) —
-         *  stay put, do NOT open the app; FAILED = the
-         *  server is dead / a transient failure — the
-         *  tunnel is stopped (or never started) and the
-         *  tap stays put, the caller may retry the next
-         *  server; PENDING = the tunnel did not come up
-         *  within the wait — it may still come up, stay
-         *  put, the service pushes widget/tile updates
-         *  when/if it does; FELL_BACK = the app opened
-         *  (definite failure only) — the caller must
-         *  stop, nothing more to try. */
+        /** connectResolved outcomes: OK = tunnel up (the
+         *  through-tunnel probe is ADVISORY ONLY since
+         *  3.1 fix10 — see verifyTunnel); STOP_TIMEOUT =
+         *  the old tunnel is still serving (stop did not
+         *  clear in 5 s) — stay put, do NOT open the app;
+         *  FAILED = a pre-start / transient failure (no
+         *  pass, VPN prepare threw, an unexpected throw)
+         *  — the tunnel was stopped or never started and
+         *  the tap stays put, the caller may retry the
+         *  next server; PENDING = the tunnel did not come
+         *  up within the wait — it may still come up,
+         *  stay put, the service pushes widget/tile
+         *  updates when/if it does; FELL_BACK = the app
+         *  opened (definite failure only) — the caller
+         *  must stop, nothing more to try. */
         static final int CONNECT_OK = 0;
         static final int CONNECT_STOP_TIMEOUT = 1;
         static final int CONNECT_FAILED = 2;
@@ -387,11 +394,12 @@ public final class DirectConnect {
 
         /** Start the tunnel for a resolved server, directly,
          *  without opening any activity. Returns CONNECT_OK
-         *  only when the tunnel is up AND verified to carry
-         *  traffic (the through-tunnel probe). A tunnel
-         *  that starts but carries nothing is stopped
-         *  again, so `running` can never sit true with no
-         *  internet behind it. */
+         *  when the tunnel is up. The through-tunnel probe
+         *  is ADVISORY ONLY since 3.1 fix10 (see
+         *  verifyTunnel): a missed probe never stops the
+         *  tunnel and never fails the connect — the
+         *  service's 60 s never-flowed watch is the only
+         *  dead-tunnel killer now. */
         int connectResolved(Server server) {
             try {
                 try { ConnectLog.clear(ctx); } catch (Throwable ignored) {}
@@ -514,8 +522,7 @@ public final class DirectConnect {
                     return CONNECT_FELL_BACK;
                 }
                 finishPending();
-                // Wait for the tunnel (up to 15 s), then VERIFY
-                // it carries traffic before reporting success.
+                // Wait for the tunnel (up to 15 s).
                 // 3.1 fix5: fix4 waited only 5 s and OPENED
                 // THE APP on a timeout — on a slow network the
                 // tunnel simply takes longer than 5 s, so every
@@ -527,15 +534,6 @@ public final class DirectConnect {
                 // on a definite failure (start threw, no VPN
                 // permission, reauth needed, no servers at
                 // all) — see above.
-                // 3.1 fix8: `running` only means sing-box
-                // started — a dead server starts fine (TUN
-                // up, no upstream), so waiting for `running`
-                // alone is exactly the reported "Connected,
-                // no internet". The probe below is the gate:
-                // one retry for a slow start, then the dead
-                // tunnel is stopped again and the attempt
-                // counts as failed (the caller retries the
-                // next server, or stays put).
                 // 3.1 fix9: a tunnel that did not come up
                 // within the wait is NOT a failure — it may
                 // still come up, and the service pushes
@@ -546,19 +544,21 @@ public final class DirectConnect {
                     stayPut("tunnel not up yet");
                     return CONNECT_PENDING;
                 }
-                if (!verifyTunnel()) {
-                    try { ConnectLog.log(ctx, "direct connect unverified, stopping dead tunnel"); }
-                    catch (Throwable ignored) {}
-                    stopDeadTunnel();
-                    // 3.1 fix9: a dead server is cleaned up
-                    // and the tap stays put — the old code
-                    // returned FAILED and the caller opened
-                    // the app. The service's never-flowed
-                    // watch is the backstop for a tunnel
-                    // that passes the probe and dies later.
-                    stayPut("probe failed");
-                    return CONNECT_FAILED;
-                }
+                // 3.1 fix10: the through-tunnel probe is
+                // ADVISORY ONLY — it logs its result and
+                // never stops the tunnel. The fix9 probe was
+                // a hard gate: the user's 2026-11-23 log
+                // shows it missing all 3 attempts on a
+                // HEALTHY tunnel (establish OK, running=
+                // true, then "stopping dead tunnel" 4.2 s
+                // later) and killing it, because a probe at
+                // connect time cannot tell a dead server
+                // from a slow warm-up (cold TLS + DNS
+                // bootstrap through the tunnel). The
+                // service's 60 s never-flowed watch is the
+                // only dead-tunnel killer now — it gives
+                // the tunnel a full minute to warm up.
+                verifyTunnel();
                 if (AppSettings.SEL_FASTEST.equals(AppSettings.getLastSelection(ctx))) {
                     try {
                         AppSettings.saveWidgetBest(ctx, server.ip,
@@ -579,41 +579,54 @@ public final class DirectConnect {
             }
         }
 
-        /** Through-tunnel probe, patient: up to 3 attempts
-         *  2 s apart. True when real traffic flowed through
-         *  the tunnel. 3.1 fix9: the old 2 attempts 1 s
-         *  apart fired while a fresh tunnel was still
-         *  warming up (Firefox hostname DNS, first CONNECT)
-         *  and declared a good tunnel dead — then the
-         *  caller opened the app. A tunnel that cannot
-         *  carry traffic 6 s after coming up is dead; a
-         *  slower one gets its chance. */
+        /** Through-tunnel probe, ADVISORY ONLY (3.1
+         *  fix10): up to 3 attempts 2 s apart, but a
+         *  missed probe NEVER stops the tunnel and NEVER
+         *  fails the connect — the caller logs the
+         *  outcome and completes the connect as OK either
+         *  way. The fix9 hard gate killed healthy tunnels:
+         *  the user's 2026-11-23 log shows all 3
+         *  attempts missing on a tunnel that had just
+         *  established cleanly (establish OK, running=
+         *  true), then "stopping dead tunnel" 4.2 s
+         *  later. Each failed attempt logs its reason
+         *  ("probe attempt N failed: <reason>") so the
+         *  next diagnosis is not blind; a success logs
+         *  "probe ok ms=… attempt=N". Returns true when
+         *  real traffic flowed through the tunnel. */
         boolean verifyTunnel() {
             for (int attempt = 0; attempt < 3; attempt++) {
                 try {
-                    if (tunnelProbeMs() >= 0) return true;
-                } catch (Throwable ignored) {}
+                    ProbeOutcome o;
+                    if (probeOverrideMsForTest != null) {
+                        long ms = probeOverrideMsForTest.longValue();
+                        o = ms >= 0 ? new ProbeOutcome(ms, null)
+                                : new ProbeOutcome(-1, "test override");
+                    } else {
+                        o = probeThroughProxyOutcome("127.0.0.1", 1080,
+                                "http://www.gstatic.com/generate_204");
+                    }
+                    if (o.ms >= 0) {
+                        try { ConnectLog.log(ctx, "probe ok ms=" + o.ms
+                                + " attempt=" + (attempt + 1)); }
+                        catch (Throwable ignored) {}
+                        return true;
+                    }
+                    try { ConnectLog.log(ctx, "probe attempt " + (attempt + 1)
+                            + " failed: " + o.reason); }
+                    catch (Throwable ignored) {}
+                } catch (Throwable t) {
+                    try { ConnectLog.log(ctx, "probe attempt " + (attempt + 1)
+                            + " failed: " + t.getClass().getSimpleName()); }
+                    catch (Throwable ignored) {}
+                }
                 if (attempt < 2) {
                     try { Thread.sleep(2000); } catch (InterruptedException e) { return false; }
                 }
             }
+            try { ConnectLog.log(ctx, "probe missed (advisory, tunnel left up)"); }
+            catch (Throwable ignored) {}
             return false;
-        }
-
-        /** Stop a tunnel that started but carries no traffic,
-         *  and wait briefly for `running` to clear so the
-         *  tile never reads the stale true. */
-        void stopDeadTunnel() {
-            try {
-                Intent d = new Intent(ctx, VpnTunnelService.class);
-                d.setAction(VpnTunnelService.ACTION_DISCONNECT);
-                ctx.startService(d);
-            } catch (Throwable ignored) {}
-            for (int k = 0; k < 30; k++) {
-                if (!VpnTunnelService.running) break;
-                try { Thread.sleep(100); } catch (InterruptedException e) { break; }
-            }
-            refreshTileAndWidget();
         }
 
         /** Push widget + tile updates so both read the real
@@ -654,13 +667,54 @@ public final class DirectConnect {
      *  sing-box starts fine with a dead server (TUN up,
      *  no upstream), so a tile connect that only waits for
      *  `running` can report Connected with no internet.
-     *  This probe is the gate before any success is
-     *  reported — and the service's stall watch uses it
-     *  to confirm a stalled tunnel before stopping it. */
+     *  Since 3.1 fix10 the probe is ADVISORY on the tap
+     *  path (verifyTunnel logs it and never stops the
+     *  tunnel); it is a real gate only in the service's
+     *  stall / never-flowed watch, which confirms a
+     *  stalled tunnel before stopping it. */
     static long tunnelProbeMs() {
         return probeThroughProxy("127.0.0.1", 1080,
                 "http://www.gstatic.com/generate_204");
     }
+
+    /** Probe outcome: ms >= 0 when traffic flowed; on
+     *  failure ms is -1 and reason names the failure
+     *  (exception class + short message, capped — never
+     *  a URL, token, or credential). 3.1 fix10: the
+     *  fix9 probe failed silently, so the user's log
+     *  could not say WHY it missed. */
+    static final class ProbeOutcome {
+        final long ms;
+        final String reason;
+        ProbeOutcome(long ms, String reason) {
+            this.ms = ms;
+            this.reason = reason;
+        }
+    }
+
+    /** Short failure reason for the probe log: exception
+     *  class + message, capped at 160 chars. The probe
+     *  URL is the public generate_204 endpoint and the
+     *  proxy is loopback, so nothing sensitive can
+     *  appear here. */
+    static String describeFailure(Throwable t) {
+        try {
+            String m = t.getMessage();
+            String s = t.getClass().getSimpleName()
+                    + (m == null || m.isEmpty() ? "" : ": " + m);
+            return s.length() > 160 ? s.substring(0, 160) : s;
+        } catch (Throwable ignored) {
+            return "probe failed";
+        }
+    }
+
+    /** TEST-ONLY seam: when non-null, verifyTunnel uses
+     *  this value instead of the real socket probe (a
+     *  non-negative value = success in that many ms, a
+     *  negative value = failure). Loopback TCP is denied
+     *  in this VM, so the success path cannot be shown
+     *  with a real socket here. Never set by app code. */
+    static volatile Long probeOverrideMsForTest = null;
 
     /** The probe against an explicit proxy + URL (the
      *  test seam for the failure path: a closed port
@@ -668,13 +722,25 @@ public final class DirectConnect {
     static long probeThroughProxy(String proxyHost, int proxyPort,
             String urlString) {
         try {
+            return probeThroughProxyOutcome(proxyHost, proxyPort, urlString).ms;
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    /** Same as probeThroughProxy, but with the failure
+     *  reason (3.1 fix10 — the silent -1 hid why the
+     *  probe missed). */
+    static ProbeOutcome probeThroughProxyOutcome(String proxyHost, int proxyPort,
+            String urlString) {
+        try {
             Proxy proxy = new Proxy(Proxy.Type.HTTP,
                     new InetSocketAddress(proxyHost, proxyPort));
             HttpURLConnection c = (HttpURLConnection)
                     new URL(urlString).openConnection(proxy);
-            return probeConnection(c);
-        } catch (Throwable ignored) {
-            return -1;
+            return probeConnectionOutcome(c);
+        } catch (Throwable t) {
+            return new ProbeOutcome(-1, describeFailure(t));
         }
     }
 
@@ -686,6 +752,17 @@ public final class DirectConnect {
      *  the response headers, or -1 on any failure. */
     static long probeConnection(HttpURLConnection c) {
         try {
+            return probeConnectionOutcome(c).ms;
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    /** Same as probeConnection, but with the failure
+     *  reason (3.1 fix10). A non-2xx response is a
+     *  failure with reason "HTTP <code>". */
+    static ProbeOutcome probeConnectionOutcome(HttpURLConnection c) {
+        try {
             c.setConnectTimeout(5000);
             c.setReadTimeout(5000);
             c.setRequestMethod("GET");
@@ -693,10 +770,12 @@ public final class DirectConnect {
             long t0 = System.currentTimeMillis();
             int code = c.getResponseCode();
             long ms = System.currentTimeMillis() - t0;
-            if (code == 204 || (code >= 200 && code < 300)) return ms;
-            return -1;
-        } catch (Throwable ignored) {
-            return -1;
+            if (code == 204 || (code >= 200 && code < 300)) {
+                return new ProbeOutcome(ms, null);
+            }
+            return new ProbeOutcome(-1, "HTTP " + code);
+        } catch (Throwable t) {
+            return new ProbeOutcome(-1, describeFailure(t));
         } finally {
             try { c.disconnect(); } catch (Throwable ignored) {}
         }
