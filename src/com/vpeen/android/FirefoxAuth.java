@@ -909,6 +909,30 @@ public final class FirefoxAuth {
         return q;
     }
 
+    /** The stored ProxyPass token when it exists and has
+     *  not expired yet — even inside the 60 s early
+     *  margin. The service's renewal loop refreshes the
+     *  pass live at expiry - 2 min, so a pass with any
+     *  life left is usable for a fresh connect. Lets a
+     *  widget/tile tap start the tunnel without a network
+     *  fetch first (3.1 fix9: that fetch delayed the
+     *  foreground-service start past the tap interaction
+     *  window, so the start was refused and the tap fell
+     *  back to opening the app). Null when there is no
+     *  stored pass or it already expired. */
+    public static String cachedProxyPass(Context ctx) {
+        try {
+            SharedPreferences p = prefs(ctx);
+            String pass = p.getString(KEY_PASS, "");
+            long exp = p.getLong(KEY_PASS_EXP, 0);
+            if (pass != null && !pass.isEmpty()
+                    && exp > System.currentTimeMillis()) return pass;
+            return null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     /** A valid (unexpired) ProxyPass JWT for CONNECT, fetching
      *  or refreshing whatever is stale: access token first
      *  (refresh grant), then the pass itself; on 403 activate

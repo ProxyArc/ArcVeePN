@@ -73,6 +73,102 @@ public final class AppSettings {
     public static final String KEY_WIDGET_PINGS = "widget_pings";
     public static final String KEY_WIDGET_BEST = "widget_best";
 
+    // 3.1 fix8: the DURABLE tunnel state — the Quick
+    // Settings tile's source of truth. The old state lived
+    // only in the in-memory static VpnTunnelService.running
+    // plus the SystemUI-persisted Tile state (whatever the
+    // last updateTile() wrote). When the app process died
+    // without onDestroy/stopTunnel running (HyperOS
+    // swipe-kill, memory pressure, native crash), nothing
+    // ever corrected either record: the tile kept showing
+    // "Connected" for a dead tunnel, and a fresh process
+    // had no way to tell "still up" from "died with the
+    // process". The service writes this on every state
+    // change (connected with a server label, disconnected
+    // on stop) and touches the heartbeat while the tunnel
+    // is up; the tile treats a persisted "connected" as
+    // real ONLY while the heartbeat is fresh. Stored as
+    // JSON: {"connected":<bool>,"atMs":<ms>,
+    //        "heartbeatMs":<ms>,"server":"<label>"}.
+    public static final String KEY_TUNNEL_STATE = "tunnel_state";
+    /** A persisted "connected" older than this without a
+     *  fresh heartbeat is a dead process, not a live
+     *  tunnel. 120 s = four 30 s heartbeat ticks. */
+    public static final long TUNNEL_HEARTBEAT_STALE_MS = 120000L;
+
+    /** The durable tunnel state. Never null. */
+    public static final class TunnelState {
+        public final boolean connected;
+        public final long atMs;
+        public final long heartbeatMs;
+        public final String server;
+        public TunnelState(boolean connected, long atMs,
+                long heartbeatMs, String server) {
+            this.connected = connected;
+            this.atMs = atMs;
+            this.heartbeatMs = heartbeatMs;
+            this.server = server == null ? "" : server;
+        }
+        public static TunnelState disconnected() {
+            return new TunnelState(false, 0, 0, "");
+        }
+    }
+
+    /** Pure: is a persisted state a LIVE tunnel right now?
+     *  A stored "connected" counts only while its
+     *  heartbeat is fresh — a stale heartbeat means the
+     *  writing process is dead (its onDestroy never ran),
+     *  so the tunnel is dead too. A heartbeat from the
+     *  future (clock skew) counts as fresh. */
+    public static boolean isTunnelStateAlive(TunnelState s, long nowMs) {
+        if (s == null || !s.connected) return false;
+        if (s.heartbeatMs <= 0) return false;
+        return nowMs - s.heartbeatMs <= TUNNEL_HEARTBEAT_STALE_MS;
+    }
+
+    /** Record a tunnel state change (service only). */
+    public static void setTunnelState(Context ctx, boolean connected,
+            String serverLabel) {
+        try {
+            long now = System.currentTimeMillis();
+            JSONObject o = new JSONObject();
+            o.put("connected", connected);
+            o.put("atMs", now);
+            o.put("heartbeatMs", now);
+            o.put("server", serverLabel == null ? "" : serverLabel);
+            prefs(ctx).edit().putString(KEY_TUNNEL_STATE, o.toString()).apply();
+        } catch (Throwable ignored) {}
+    }
+
+    /** Refresh the heartbeat of a live tunnel (service
+     *  only). A no-op when nothing is recorded connected. */
+    public static void touchTunnelHeartbeat(Context ctx) {
+        try {
+            TunnelState s = getTunnelState(ctx);
+            if (s == null || !s.connected) return;
+            JSONObject o = new JSONObject();
+            o.put("connected", true);
+            o.put("atMs", s.atMs);
+            o.put("heartbeatMs", System.currentTimeMillis());
+            o.put("server", s.server);
+            prefs(ctx).edit().putString(KEY_TUNNEL_STATE, o.toString()).apply();
+        } catch (Throwable ignored) {}
+    }
+
+    /** The persisted tunnel state. Never null. */
+    public static TunnelState getTunnelState(Context ctx) {
+        try {
+            String s = prefs(ctx).getString(KEY_TUNNEL_STATE, "");
+            if (s == null || s.isEmpty()) return TunnelState.disconnected();
+            JSONObject o = new JSONObject(s);
+            return new TunnelState(o.optBoolean("connected", false),
+                    o.optLong("atMs", 0), o.optLong("heartbeatMs", 0),
+                    o.optString("server", ""));
+        } catch (Throwable ignored) {
+            return TunnelState.disconnected();
+        }
+    }
+
     public static final String MODE_VPN = "vpn";
     public static final String MODE_PROXY = "proxy";
     public static final String SPLIT_OFF = "off";

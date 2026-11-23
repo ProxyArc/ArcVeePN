@@ -280,6 +280,14 @@ public class VpnTunnelService extends VpnService {
                     ? sub.flag : sub.ip;
             status = "Connected to " + fl;
             ConnectLog.log(this, "running=true");
+            // 3.1 fix8: persist the tunnel state for the tile
+            // (durable source of truth) and start the
+            // heartbeat/stall watch — the tile path has no
+            // MainActivity watchdog, so a tunnel that later
+            // goes silent must be caught here, not only in
+            // the activity.
+            try { AppSettings.setTunnelState(this, true, fl); } catch (Throwable ignored) {}
+            try { startTunnelWatch(); } catch (Throwable ignored) {}
             Log.i(TAG, "sing-box tunnel up (sub), server=" + sub);
             try { registerNetCallback(); } catch (Throwable ignored) {}
             // 3.1 fix: a Firefox tunnel's ProxyPass JWT expires
@@ -462,6 +470,107 @@ public class VpnTunnelService extends VpnService {
             Thread t = ffxRenewThread;
             ffxRenewThread = null;
             if (t != null) t.interrupt();
+        } catch (Throwable ignored) {}
+    }
+
+    private volatile Thread tunnelWatchThread = null;
+    private volatile boolean tunnelWatchStop = false;
+
+    /** 3.1 fix8 — heartbeat + stall watch for the tile
+     *  path. The MainActivity watchdog (30 s checks, 90 s
+     *  stall -> optimize) only runs while the activity is
+     *  alive; a tile/widget connect with the app closed
+     *  had NO watchdog at all, so a tunnel that went
+     *  silent stayed "Connected" forever. This daemon
+     *  thread runs while the tunnel is up: every 30 s it
+     *  touches the durable heartbeat (so the tile can
+     *  tell a live tunnel from a dead process) and, with
+     *  the SAME sb9 guard as the activity watchdog (only
+     *  after real traffic was once seen, >60 s since
+     *  connect, no byte change for 90 s), verifies the
+     *  tunnel with a through-tunnel probe — a confirmed
+     *  dead tunnel is stopped, which clears running,
+     *  persists disconnected, and refreshes widget/tile.
+     *  Never fires on a never-flowed stats stream: that
+     *  case is the direct connect's post-connect probe. */
+    private void startTunnelWatch() {
+        try {
+            if (tunnelWatchThread != null && tunnelWatchThread.isAlive()) return;
+            tunnelWatchStop = false;
+            tunnelWatchThread = new Thread(() -> {
+                long prevBytes = -1;
+                long lastChange = System.currentTimeMillis();
+                // 3.1 fix9: whether the never-flowed probe
+                // below already ran for this tunnel.
+                boolean neverFlowedProbed = false;
+                while (!tunnelWatchStop && running) {
+                    try { Thread.sleep(30000); } catch (Throwable e) { break; }
+                    if (tunnelWatchStop || !running) break;
+                    try { AppSettings.touchTunnelHeartbeat(this); } catch (Throwable ignored) {}
+                    try {
+                        long[] st = tunnelStats();
+                        long total = (st.length > 3 ? st[1] + st[3] : 0);
+                        long now = System.currentTimeMillis();
+                        // sb9: NEVER treat a dead stats stream
+                        // as a stall — only a stall AFTER real
+                        // traffic was seen counts.
+                        if (!statsEverNonZero) {
+                            prevBytes = total; lastChange = now;
+                            // 3.1 fix9: the never-flowed case
+                            // is no longer the tap's
+                            // post-connect probe (that probe
+                            // must never open the app) — so
+                            // the service itself must catch a
+                            // stillborn tunnel. After 60 s
+                            // with zero bytes, probe once: a
+                            // failed probe stops the tunnel
+                            // (clearing running, persisting
+                            // disconnected, refreshing
+                            // widget/tile). A successful probe
+                            // means the tunnel works and the
+                            // user is just idle — the probe's
+                            // own traffic makes the stats
+                            // non-zero, so this fires at most
+                            // once per tunnel.
+                            if (!neverFlowedProbed && connectedAtMs > 0
+                                    && now - connectedAtMs > 60000) {
+                                neverFlowedProbed = true;
+                                long probe = DirectConnect.tunnelProbeMs();
+                                if (probe < 0) {
+                                    try { ConnectLog.log(this, "tunnel watch: never flowed, probe failed, stopping"); } catch (Throwable ignored) {}
+                                    try { stopTunnel(); } catch (Throwable ignored) {}
+                                }
+                            }
+                            continue;
+                        }
+                        if (prevBytes < 0) { prevBytes = total; lastChange = now; continue; }
+                        if (total != prevBytes) { prevBytes = total; lastChange = now; continue; }
+                        if (connectedAtMs > 0 && now - connectedAtMs > 60000
+                                && now - lastChange > 90000) {
+                            // Stall after real traffic: verify
+                            // with a real through-tunnel probe
+                            // before stopping anything.
+                            lastChange = now;
+                            long probe = DirectConnect.tunnelProbeMs();
+                            if (probe < 0) {
+                                try { ConnectLog.log(this, "tunnel watch: stall confirmed by probe, stopping"); } catch (Throwable ignored) {}
+                                try { stopTunnel(); } catch (Throwable ignored) {}
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }, "vpeen-tunnel-watch");
+            tunnelWatchThread.setDaemon(true);
+            tunnelWatchThread.start();
+        } catch (Throwable ignored) {}
+    }
+
+    private void stopTunnelWatch() {
+        try {
+            tunnelWatchStop = true;
+            Thread t = tunnelWatchThread;
+            tunnelWatchThread = null;
+            if (t != null && t != Thread.currentThread()) t.interrupt();
         } catch (Throwable ignored) {}
     }
 
@@ -738,6 +847,10 @@ public class VpnTunnelService extends VpnService {
         connectedAtMs = 0;
         status = "Disconnected";
         resetTraffic();
+        // 3.1 fix8: persist the disconnect (the tile reads
+        // this durable state) and stop the watch thread.
+        try { AppSettings.setTunnelState(this, false, ""); } catch (Throwable ignored) {}
+        try { stopTunnelWatch(); } catch (Throwable ignored) {}
         try { if (runner != null) runner.stop(); } catch (Throwable ignored) {}
         runner = null;
         try { stopForeground(true); } catch (Throwable ignored) {}

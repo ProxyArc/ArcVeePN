@@ -6,8 +6,11 @@ import android.content.Intent;
 import android.net.VpnService;
 import android.os.Build;
 
+import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
+import java.net.Proxy;
 import java.net.Socket;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -157,6 +160,24 @@ public final class DirectConnect {
             }
         }
 
+        /** Stay put WITHOUT opening the app: log the
+         *  reason, refresh widget + tile to the real
+         *  state, finish the pending result. 3.1 fix9: a
+         *  slow tunnel, a probe that hasn't had time, or
+         *  a transient failure must NEVER open the app —
+         *  only a definite failure the app alone can
+         *  resolve (VPN permission not granted, Firefox
+         *  login lost with no token at all, foreground-
+         *  service start refused) falls back. The user
+         *  can tap again; the service pushes widget/tile
+         *  updates when/if the tunnel comes up. */
+        void stayPut(String reason) {
+            try { ConnectLog.log(ctx, "direct stay-put: " + reason); }
+            catch (Throwable ignored) {}
+            refreshTileAndWidget();
+            finishPending();
+        }
+
         /** Open the app — ONLY on a definite failure (no VPN
          *  permission yet, Firefox login lost, no servers at
          *  all). 3.1 fix6: every app-open is logged with its
@@ -168,6 +189,10 @@ public final class DirectConnect {
             try { ConnectLog.log(ctx, "direct fallback: " + reason); }
             catch (Throwable ignored) {}
             try { opener.openApp(ctx); } catch (Throwable ignored) {}
+            // 3.1 fix8: the tile must show the real state
+            // even when the fallback itself fails silently —
+            // a failed tap must never leave a stale tile.
+            try { ArcVeePNTileService.requestTileUpdate(ctx); } catch (Throwable ignored) {}
             finishPending();
         }
 
@@ -194,7 +219,12 @@ public final class DirectConnect {
                         return;
                 }
             } catch (Throwable t) {
-                fallback("toggle threw " + t.getClass().getSimpleName());
+                // 3.1 fix9: an unexpected exception is not
+                // a definite failure — stay put, never open
+                // the app for it. The old code fell back
+                // here, so any transient throw (a prefs
+                // read, a stale list) opened the app.
+                stayPut("toggle threw " + t.getClass().getSimpleName());
             }
         }
 
@@ -205,7 +235,15 @@ public final class DirectConnect {
                 ctx.startService(i);
             } catch (Throwable ignored) {}
             finishPending();
-            try { Thread.sleep(300); } catch (InterruptedException e) { }
+            // 3.1 fix8: wait for the stop to land before
+            // refreshing the tile. The old fixed 300 ms
+            // sleep raced the async stop, so the tile update
+            // could read the OLD running=true and the tile
+            // stayed "Connected" after a disconnect tap.
+            for (int k = 0; k < 20; k++) {
+                if (!VpnTunnelService.running) break;
+                try { Thread.sleep(100); } catch (InterruptedException e) { break; }
+            }
             try { ArcVeePNWidget.updateAll(ctx); } catch (Throwable ignored) {}
             try { ArcVeePNTileService.requestTileUpdate(ctx); } catch (Throwable ignored) {}
         }
@@ -232,9 +270,18 @@ public final class DirectConnect {
                 }
                 try { AppSettings.setLastSelection(ctx, "sub:" + server.ip); }
                 catch (Throwable ignored) {}
+                // 3.1 fix9: the outcome is handled inside
+                // connectResolved (stay-put, or the
+                // definite-failure fallback). A dead server,
+                // a slow tunnel, or a transient failure
+                // NEVER opens the app here — the old code
+                // fell back on CONNECT_FAILED, so the fix8
+                // probe (which fires while a fresh tunnel
+                // is still warming up) opened the app on
+                // every widget tap whose first probe missed.
                 connectResolved(server);
             } catch (Throwable t) {
-                fallback("connectHost threw " + t.getClass().getSimpleName());
+                stayPut("connectHost threw " + t.getClass().getSimpleName());
             }
         }
 
@@ -242,19 +289,55 @@ public final class DirectConnect {
             try {
                 try { AppSettings.setLastSelection(ctx, AppSettings.SEL_FASTEST); }
                 catch (Throwable ignored) {}
-                List<Server> list = loadServers(ctx);
-                if (list == null || list.isEmpty()) { fallback("no servers for fastest"); return; }
+                // 3.1 fix9: CACHE ONLY — no network fetch and
+                // no ping sweep before the foreground-service
+                // start. The old code fetched the network
+                // when the cache was empty and swept pings
+                // for up to 4 s first; on a strict ROM that
+                // delay lets the tap interaction window
+                // close, so the service start is refused and
+                // the tap falls back to opening the app (the
+                // fix8 tile finding, same defect class). The
+                // cached pings rank the servers; with none
+                // measured, list order decides. An empty
+                // cache means an empty widget list too —
+                // stay put; the app fetches on open. The
+                // ping-test button still sweeps on demand.
+                List<Server> list = cachedServers(ctx);
+                if (list == null || list.isEmpty()) { stayPut("no cached servers for fastest"); return; }
                 Map<String, Long> pings = AppSettings.getWidgetPings(ctx);
-                Server best = WidgetList.bestOf(list, pings);
-                if (best == null) {
-                    runPingSweepSync(ctx, list, FASTEST_SWEEP_BUDGET_MS);
-                    pings = AppSettings.getWidgetPings(ctx);
-                    best = WidgetList.bestOf(list, pings);
+                // 3.1 fix8: up to 3 attempts, best-first,
+                // skipping servers that just failed the
+                // traffic probe — the old code connected to
+                // the first untested server (list.get(0))
+                // whenever no ping was measured, and a dead
+                // pick stayed "Connected" with no internet.
+                java.util.Set<String> tried = new java.util.HashSet<>();
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    Server best = nextBest(list, pings, tried);
+                    if (best == null) break;
+                    tried.add(best.ip);
+                    int st = connectResolved(best);
+                    if (st == CONNECT_OK) return;
+                    // The app opened (definite failure) or
+                    // the old tunnel is still serving or the
+                    // tunnel may still come up: stop here,
+                    // do NOT try the next server and do NOT
+                    // open the app.
+                    if (st == CONNECT_FELL_BACK) return;
+                    if (st == CONNECT_STOP_TIMEOUT) return;
+                    if (st == CONNECT_PENDING) return;
+                    // CONNECT_FAILED: the server was dead —
+                    // try the next best.
                 }
-                if (best == null) best = list.get(0);
-                connectResolved(best);
+                // 3.1 fix9: all attempts dead — stay put.
+                // The old code fell back to the app here, so
+                // a tap with three slow/dead servers opened
+                // it. The dead tunnels are already stopped;
+                // the widget shows the real state.
+                stayPut("no working server");
             } catch (Throwable t) {
-                fallback("connectFastest threw " + t.getClass().getSimpleName());
+                stayPut("connectFastest threw " + t.getClass().getSimpleName());
             }
         }
 
@@ -268,7 +351,14 @@ public final class DirectConnect {
         Server resolveServer(String host, String proto) {
             try {
                 if (host == null || host.isEmpty()) return null;
-                List<Server> list = loadServers(ctx);
+                // 3.1 fix9: cache ONLY — the old code called
+                // loadServers() here, which fetched the
+                // network when the cache was empty, delaying
+                // the foreground-service start past the tap
+                // interaction window. An empty cache means
+                // an empty widget list too, so the row could
+                // not have been tapped from a fresh list.
+                List<Server> list = cachedServers(ctx);
                 List<Server> widget = widgetServers(ctx);
                 return resolveServerFromLists(host, proto, list, widget);
             } catch (Throwable ignored) {
@@ -276,9 +366,33 @@ public final class DirectConnect {
             }
         }
 
+        /** connectResolved outcomes: OK = tunnel up and
+         *  verified; STOP_TIMEOUT = the old tunnel is
+         *  still serving (stop did not clear in 5 s) —
+         *  stay put, do NOT open the app; FAILED = the
+         *  server is dead / a transient failure — the
+         *  tunnel is stopped (or never started) and the
+         *  tap stays put, the caller may retry the next
+         *  server; PENDING = the tunnel did not come up
+         *  within the wait — it may still come up, stay
+         *  put, the service pushes widget/tile updates
+         *  when/if it does; FELL_BACK = the app opened
+         *  (definite failure only) — the caller must
+         *  stop, nothing more to try. */
+        static final int CONNECT_OK = 0;
+        static final int CONNECT_STOP_TIMEOUT = 1;
+        static final int CONNECT_FAILED = 2;
+        static final int CONNECT_PENDING = 3;
+        static final int CONNECT_FELL_BACK = 4;
+
         /** Start the tunnel for a resolved server, directly,
-         *  without opening any activity. */
-        void connectResolved(Server server) {
+         *  without opening any activity. Returns CONNECT_OK
+         *  only when the tunnel is up AND verified to carry
+         *  traffic (the through-tunnel probe). A tunnel
+         *  that starts but carries nothing is stopped
+         *  again, so `running` can never sit true with no
+         *  internet behind it. */
+        int connectResolved(Server server) {
             try {
                 try { ConnectLog.clear(ctx); } catch (Throwable ignored) {}
                 try { ConnectLog.log(ctx, "direct connect begin host=" + server.ip); }
@@ -306,19 +420,54 @@ public final class DirectConnect {
                     if (VpnTunnelService.running) {
                         try { ConnectLog.log(ctx, "direct stop timeout, still running"); }
                         catch (Throwable ignored) {}
+                        // 3.1 fix8: never return silently here
+                        // — refresh the tile so it re-reads the
+                        // real (durable) state instead of
+                        // sitting stale after a dead tap. The
+                        // old tunnel keeps serving meanwhile, so
+                        // this is STOP_TIMEOUT (stay put), NOT a
+                        // failure — the caller must NOT open the
+                        // app for it (fix6 scenario E).
+                        refreshTileAndWidget();
                         finishPending();
-                        return;
+                        return CONNECT_STOP_TIMEOUT;
                     }
                 }
                 // Firefox servers need a live ProxyPass token.
                 String ffxPass = null;
                 if ("firefox".equals(server.proto)) {
-                    try {
-                        ffxPass = FirefoxAuth.ensureProxyPass(ctx);
-                    } catch (FirefoxAuth.FfxException e) {
-                        if (e.reauth) { fallback("firefox reauth"); return; }
-                    } catch (Throwable ignored) {}
-                    if (ffxPass == null || ffxPass.isEmpty()) { fallback("firefox pass null"); return; }
+                    // 3.1 fix9: prefer the STORED pass, even
+                    // inside the 60 s early margin — the
+                    // service's renewal loop refreshes it
+                    // live at expiry - 2 min. The old code
+                    // fetched a fresh pass here whenever the
+                    // stored one was within 60 s of expiry;
+                    // that network fetch delayed the
+                    // foreground-service start past the tap
+                    // interaction window. Only when there is
+                    // NO stored pass at all do we fetch.
+                    try { ffxPass = FirefoxAuth.cachedProxyPass(ctx); } catch (Throwable ignored) {}
+                    if (ffxPass == null || ffxPass.isEmpty()) {
+                        try {
+                            ffxPass = FirefoxAuth.ensureProxyPass(ctx);
+                        } catch (FirefoxAuth.FfxException e) {
+                            // Dead login: the ONLY pass failure
+                            // the app alone can resolve (the
+                            // login dialog). Anything else is
+                            // transient — stay put, never open
+                            // the app for a network blip.
+                            if (e.reauth) { fallback("firefox reauth"); return CONNECT_FELL_BACK; }
+                            stayPut("firefox pass fetch failed");
+                            return CONNECT_FAILED;
+                        } catch (Throwable ignored) {
+                            stayPut("firefox pass threw");
+                            return CONNECT_FAILED;
+                        }
+                    }
+                    if (ffxPass == null || ffxPass.isEmpty()) {
+                        stayPut("firefox pass null");
+                        return CONNECT_FAILED;
+                    }
                 }
                 // VPN permission (proxy mode needs none). A
                 // non-null prepare intent means the user has
@@ -326,10 +475,12 @@ public final class DirectConnect {
                 if (!AppSettings.isProxyMode(ctx)) {
                     try {
                         Intent prep = VpnService.prepare(ctx);
-                        if (prep != null) { fallback("vpn prepare needed"); return; }
+                        if (prep != null) { fallback("vpn prepare needed"); return CONNECT_FELL_BACK; }
                     } catch (Throwable t) {
-                        fallback("vpn prepare threw " + t.getClass().getSimpleName());
-                        return;
+                        // 3.1 fix9: a throw here is not the
+                        // permission itself — stay put.
+                        stayPut("vpn prepare threw " + t.getClass().getSimpleName());
+                        return CONNECT_FAILED;
                     }
                 }
                 String display = (server.flag != null && !server.flag.isEmpty())
@@ -349,40 +500,127 @@ public final class DirectConnect {
                 } catch (Throwable t) {
                     // ForegroundServiceStartNotAllowedException
                     // or anything else: fall back to the app.
+                    // 3.1 fix9: this stays a fallback — when
+                    // the direct start is refused there is no
+                    // other way to connect from the widget,
+                    // and the app-open is the only recovery.
+                    // The pre-start work above is now cache-
+                    // only, so the start fires while the tap
+                    // interaction is still live and this
+                    // should almost never happen.
                     try { ConnectLog.log(ctx, "direct start failed, fallback"); }
                     catch (Throwable ignored) {}
                     fallback("start threw " + t.getClass().getSimpleName());
-                    return;
+                    return CONNECT_FELL_BACK;
                 }
                 finishPending();
-                // Wait for the tunnel (up to 15 s), then push
-                // widget/tile updates. 3.1 fix5: fix4 waited
-                // only 5 s and OPENED THE APP on a timeout —
-                // on a slow network the tunnel simply takes
-                // longer than 5 s, so every widget/tile tap
-                // opened the app. A slow tunnel is NOT a
-                // failure: the service pushes widget/tile
-                // updates when/if it comes up, and the widget
-                // still shows Disconnected so the user can tap
-                // again. The fallback fires only on a definite
-                // failure (start threw, no VPN permission,
-                // reauth needed, no servers at all) — see above.
-                if (awaitTunnel(() -> VpnTunnelService.running, TUNNEL_WAIT_MS)) {
-                    if (AppSettings.SEL_FASTEST.equals(AppSettings.getLastSelection(ctx))) {
-                        try {
-                            AppSettings.saveWidgetBest(ctx, server.ip,
-                                    server.flag == null ? "" : server.flag);
-                        } catch (Throwable ignored) {}
-                    }
-                    try { ArcVeePNWidget.updateAll(ctx); } catch (Throwable ignored) {}
-                    try { ArcVeePNTileService.requestTileUpdate(ctx); } catch (Throwable ignored) {}
-                } else {
-                    try { ConnectLog.log(ctx, "direct connect timeout, tunnel not up"); }
-                    catch (Throwable ignored) {}
+                // Wait for the tunnel (up to 15 s), then VERIFY
+                // it carries traffic before reporting success.
+                // 3.1 fix5: fix4 waited only 5 s and OPENED
+                // THE APP on a timeout — on a slow network the
+                // tunnel simply takes longer than 5 s, so every
+                // widget/tile tap opened the app. A slow tunnel
+                // is NOT a failure: the service pushes
+                // widget/tile updates when/if it comes up, and
+                // the widget still shows Disconnected so the
+                // user can tap again. The fallback fires only
+                // on a definite failure (start threw, no VPN
+                // permission, reauth needed, no servers at
+                // all) — see above.
+                // 3.1 fix8: `running` only means sing-box
+                // started — a dead server starts fine (TUN
+                // up, no upstream), so waiting for `running`
+                // alone is exactly the reported "Connected,
+                // no internet". The probe below is the gate:
+                // one retry for a slow start, then the dead
+                // tunnel is stopped again and the attempt
+                // counts as failed (the caller retries the
+                // next server, or stays put).
+                // 3.1 fix9: a tunnel that did not come up
+                // within the wait is NOT a failure — it may
+                // still come up, and the service pushes
+                // widget/tile updates when/if it does. The
+                // old code returned FAILED here, so the
+                // caller opened the app on every slow start.
+                if (!awaitTunnel(() -> VpnTunnelService.running, TUNNEL_WAIT_MS)) {
+                    stayPut("tunnel not up yet");
+                    return CONNECT_PENDING;
                 }
+                if (!verifyTunnel()) {
+                    try { ConnectLog.log(ctx, "direct connect unverified, stopping dead tunnel"); }
+                    catch (Throwable ignored) {}
+                    stopDeadTunnel();
+                    // 3.1 fix9: a dead server is cleaned up
+                    // and the tap stays put — the old code
+                    // returned FAILED and the caller opened
+                    // the app. The service's never-flowed
+                    // watch is the backstop for a tunnel
+                    // that passes the probe and dies later.
+                    stayPut("probe failed");
+                    return CONNECT_FAILED;
+                }
+                if (AppSettings.SEL_FASTEST.equals(AppSettings.getLastSelection(ctx))) {
+                    try {
+                        AppSettings.saveWidgetBest(ctx, server.ip,
+                                server.flag == null ? "" : server.flag);
+                    } catch (Throwable ignored) {}
+                }
+                try { ConnectLog.log(ctx, "direct connect ok host=" + server.ip); }
+                catch (Throwable ignored) {}
+                try { ArcVeePNWidget.updateAll(ctx); } catch (Throwable ignored) {}
+                try { ArcVeePNTileService.requestTileUpdate(ctx); } catch (Throwable ignored) {}
+                return CONNECT_OK;
             } catch (Throwable t) {
-                fallback("connectResolved threw " + t.getClass().getSimpleName());
+                // 3.1 fix9: an unexpected exception is not a
+                // definite failure — stay put, never open the
+                // app for it.
+                stayPut("connectResolve threw " + t.getClass().getSimpleName());
+                return CONNECT_FAILED;
             }
+        }
+
+        /** Through-tunnel probe, patient: up to 3 attempts
+         *  2 s apart. True when real traffic flowed through
+         *  the tunnel. 3.1 fix9: the old 2 attempts 1 s
+         *  apart fired while a fresh tunnel was still
+         *  warming up (Firefox hostname DNS, first CONNECT)
+         *  and declared a good tunnel dead — then the
+         *  caller opened the app. A tunnel that cannot
+         *  carry traffic 6 s after coming up is dead; a
+         *  slower one gets its chance. */
+        boolean verifyTunnel() {
+            for (int attempt = 0; attempt < 3; attempt++) {
+                try {
+                    if (tunnelProbeMs() >= 0) return true;
+                } catch (Throwable ignored) {}
+                if (attempt < 2) {
+                    try { Thread.sleep(2000); } catch (InterruptedException e) { return false; }
+                }
+            }
+            return false;
+        }
+
+        /** Stop a tunnel that started but carries no traffic,
+         *  and wait briefly for `running` to clear so the
+         *  tile never reads the stale true. */
+        void stopDeadTunnel() {
+            try {
+                Intent d = new Intent(ctx, VpnTunnelService.class);
+                d.setAction(VpnTunnelService.ACTION_DISCONNECT);
+                ctx.startService(d);
+            } catch (Throwable ignored) {}
+            for (int k = 0; k < 30; k++) {
+                if (!VpnTunnelService.running) break;
+                try { Thread.sleep(100); } catch (InterruptedException e) { break; }
+            }
+            refreshTileAndWidget();
+        }
+
+        /** Push widget + tile updates so both read the real
+         *  (durable) state after a failed attempt. */
+        void refreshTileAndWidget() {
+            try { ArcVeePNWidget.updateAll(ctx); } catch (Throwable ignored) {}
+            try { ArcVeePNTileService.requestTileUpdate(ctx); } catch (Throwable ignored) {}
         }
     }
 
@@ -402,15 +640,98 @@ public final class DirectConnect {
         }
     }
 
+    // ---- through-tunnel verification probe (3.1 fix8) ----
+
+    /** A real through-tunnel check: a minimal HTTP GET to
+     *  the generate_204 endpoint, sent through the sing-box
+     *  `mixed` inbound on 127.0.0.1:1080, which routes via
+     *  the active outbound (the connected server). The
+     *  exact mechanism MainActivity.tunnelRttMs uses for
+     *  the displayed ping — the mixed inbound listens on
+     *  1080 in VPN mode too and in proxy mode. Returns ms
+     *  to the response headers, or -1 on any failure.
+     *  `running == true` alone never proves traffic flows:
+     *  sing-box starts fine with a dead server (TUN up,
+     *  no upstream), so a tile connect that only waits for
+     *  `running` can report Connected with no internet.
+     *  This probe is the gate before any success is
+     *  reported — and the service's stall watch uses it
+     *  to confirm a stalled tunnel before stopping it. */
+    static long tunnelProbeMs() {
+        return probeThroughProxy("127.0.0.1", 1080,
+                "http://www.gstatic.com/generate_204");
+    }
+
+    /** The probe against an explicit proxy + URL (the
+     *  test seam for the failure path: a closed port
+     *  returns -1). Returns ms, or -1 on any failure. */
+    static long probeThroughProxy(String proxyHost, int proxyPort,
+            String urlString) {
+        try {
+            Proxy proxy = new Proxy(Proxy.Type.HTTP,
+                    new InetSocketAddress(proxyHost, proxyPort));
+            HttpURLConnection c = (HttpURLConnection)
+                    new URL(urlString).openConnection(proxy);
+            return probeConnection(c);
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    /** The probe against an already-opened connection
+     *  (the test seam for the success path: tests pass a
+     *  stub connection returning 204 / 500 / throwing,
+     *  because loopback TCP is denied in this VM and a
+     *  real stub proxy cannot run here). Returns ms to
+     *  the response headers, or -1 on any failure. */
+    static long probeConnection(HttpURLConnection c) {
+        try {
+            c.setConnectTimeout(5000);
+            c.setReadTimeout(5000);
+            c.setRequestMethod("GET");
+            c.setUseCaches(false);
+            long t0 = System.currentTimeMillis();
+            int code = c.getResponseCode();
+            long ms = System.currentTimeMillis() - t0;
+            if (code == 204 || (code >= 200 && code < 300)) return ms;
+            return -1;
+        } catch (Throwable ignored) {
+            return -1;
+        } finally {
+            try { c.disconnect(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /** The best server not yet tried this tap (pure over
+     *  plain values, unit tested): measured pings
+     *  first, lowest first, then the unmeasured in
+     *  list order. */
+    static Server nextBest(List<Server> list,
+            Map<String, Long> pings, java.util.Set<String> tried) {
+        List<Server> ranked = WidgetList.sortByPing(list, pings);
+        for (Server s : ranked) {
+            if (s == null || s.ip == null) continue;
+            if (tried != null && tried.contains(s.ip)) continue;
+            return s;
+        }
+        return null;
+    }
+
     // ---- server lists (cache first, network only when empty) ----
 
     /** The WIDGET's server list: the PERSISTED cache ONLY,
      *  parsed WITHOUT the passwords (the widget only shows
      *  flags/names/pings — see SubscriptionApi.parseCacheJsonLight),
-     *  and NEVER the network. An empty cache means an empty
-     *  list; the app pushes a widget update after every
-     *  successful fetch, so the list fills in as soon as the
-     *  servers arrive. Never null. */
+     *  and NEVER the network. 3.1 fix5: fix4's list factory called
+     *  loadServers() here, which fetched the network when
+     *  the cache was empty — on the main thread
+     *  (RemoteViewsFactory callbacks run there), which
+     *  froze the app for seconds whenever the cache was
+     *  empty (notably the first switch to Firefox) and
+     *  left the old list on screen. An empty cache now
+     *  means an empty list; the app pushes a widget
+     *  update after every successful fetch, so the list
+     *  fills in as soon as the servers arrive. Never null. */
     static List<Server> widgetServers(Context ctx) {
         try {
             return widgetServersFromCaches(AppSettings.isFirefoxMode(ctx),
